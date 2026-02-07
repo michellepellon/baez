@@ -1,0 +1,51 @@
+[package]
+name = "baez"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.86"
+license = "MIT"
+description = "Sync Granola meeting transcripts into an Obsidian vault with optional AI summaries"
+
+[[bin]]
+name = "baez"
+path = "src/main.rs"
+
+[lib]
+name = "baez"
+path = "src/lib.rs"
+
+[dependencies]
+clap = { version = "4.5", features = ["derive"] }
+reqwest = { version = "0.12", features = ["blocking", "json", "gzip"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+serde_yaml = "0.9"
+chrono = { version = "0.4", features = ["serde"] }
+slug = "0.1"
+indicatif = "0.17"
+rand = "0.8"
+thiserror = "1.0"
+open = "5.3.3"
+filetime = "0.2.26"
+
+# Optional features
+keyring = { version = "2.3", optional = true }
+
+[dev-dependencies]
+wiremock = "0.6"
+insta = "1.34"
+assert_fs = "1.1"
+tempfile = "3.8"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+
+[features]
+default = ["summaries"]
+summaries = ["dep:keyring"]
+
+# Binary size optimization
+[profile.release]
+opt-level = "z"      # Optimize for size
+lto = true           # Enable Link Time Optimization
+codegen-units = 1    # Better optimization (slower build)
+strip = true         # Strip debug symbols
+panic = "abort"      # Don't unwind on panic (smaller binary)

@@ -1,0 +1,30 @@
+---
+source: src/convert.rs
+expression: full
+---
+---
+doc_id: doc456
+source: granola
+date: 2025-10-28
+created: 2025-10-28T15:04:05Z
+updated: 2025-10-29T01:23:45Z
+title: Planning Session
+attendees:
+- Alice
+- Bob
+duration_minutes: 52
+tags:
+- planning
+generator: baez
+---
+
+# Planning Session
+
+_Date: 2025-10-28 | Duration: 52m | Participants: [[Alice]], [[Bob]]_
+
+#granola #meeting/planning
+
+---
+
+**[[Alice]] (15:05:10):** First thought.
+**[[Alice]] (15:05:16):** Second thought.
