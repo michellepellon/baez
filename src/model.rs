@@ -124,12 +124,16 @@ pub struct CompanyInfo {
 }
 
 /// Full document metadata from the `/v1/get-document-metadata` endpoint.
+///
+/// All fields are optional/defaulted because the Granola API sometimes returns
+/// minimal responses (e.g. only `creator` + `attendees`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DocumentMetadata {
     #[serde(default)]
     pub id: Option<String>,
     #[serde(default)]
     pub title: Option<String>,
+    #[serde(default = "Utc::now")]
     pub created_at: DateTime<Utc>,
     #[serde(default)]
     pub updated_at: Option<DateTime<Utc>>,
@@ -261,6 +265,22 @@ mod metadata_tests {
         }"#;
         let attendee: Attendee = serde_json::from_str(json).unwrap();
         assert_eq!(attendee.name.as_deref(), Some("Alice"));
+    }
+
+    #[test]
+    fn test_metadata_missing_created_at() {
+        // Some API responses omit created_at entirely (only creator + attendees).
+        let json = r#"{
+            "creator": {"name": "Alice", "email": "alice@example.com"},
+            "attendees": [{"name": "Bob"}]
+        }"#;
+        let meta: DocumentMetadata = serde_json::from_str(json).unwrap();
+        assert!(meta.id.is_none());
+        assert!(meta.title.is_none());
+        // created_at defaults to roughly "now"
+        let age = Utc::now() - meta.created_at;
+        assert!(age.num_seconds() < 5);
+        assert_eq!(meta.attendees.unwrap().len(), 1);
     }
 
     #[test]

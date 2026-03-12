@@ -149,8 +149,12 @@ pub fn sync_all(
         // Fetch metadata and transcript from API, keeping raw responses
         let meta_resp = client.get_metadata_with_raw(&doc_summary.id)?;
         let transcript_resp = client.get_transcript_with_raw(&doc_summary.id)?;
-        let meta = meta_resp.parsed;
+        let mut meta = meta_resp.parsed;
         let transcript = transcript_resp.parsed;
+
+        // The metadata endpoint sometimes omits created_at; prefer the
+        // summary's value which the list endpoint always provides.
+        meta.created_at = doc_summary.created_at;
 
         // Extract user notes from panels (my_notes -> notes field -> last_viewed_panel fallback)
         let notes_md = doc_summary
