@@ -220,16 +220,16 @@ fn test_notes_and_summary_in_markdown() {
     let notes_md = "- Follow up on deployment\n- Review PR #42";
     let summary = "Discussed deployment timeline and code review process.";
 
-    let output = baez::to_markdown(&raw, &meta, "doc-test", Some(notes_md), Some(summary)).unwrap();
+    let output = baez::to_markdown(&raw, &meta, "doc-test", Some(notes_md), Some(summary), vec![], None).unwrap();
 
     assert!(output
         .body
-        .contains("## Summary\n\nDiscussed deployment timeline and code review process."),);
+        .contains("Discussed deployment timeline and code review process."),);
     assert!(output
         .body
         .contains("## Notes\n\n- Follow up on deployment\n- Review PR #42"),);
 
-    let summary_pos = output.body.find("## Summary").unwrap();
+    let summary_pos = output.body.find("Discussed deployment timeline").unwrap();
     let notes_pos = output.body.find("## Notes").unwrap();
     let separator_pos = output.body.find("---\n").unwrap();
     let transcript_pos = output.body.find("**[[Alice]]").unwrap();
@@ -269,7 +269,7 @@ fn test_wiki_links_in_transcript() {
         attendees: None,
     };
 
-    let output = baez::to_markdown(&raw, &meta, "doc1", None, None).unwrap();
+    let output = baez::to_markdown(&raw, &meta, "doc1", None, None, vec![], None).unwrap();
     assert!(
         output.body.contains("**[[Alice]]"),
         "Speaker should be wiki-linked"
@@ -310,7 +310,7 @@ fn test_dataview_frontmatter() {
         attendees: None,
     };
 
-    let output = baez::to_markdown(&raw, &meta, "doc1", None, None).unwrap();
+    let output = baez::to_markdown(&raw, &meta, "doc1", None, None, vec![], None).unwrap();
 
     assert!(output.frontmatter_yaml.contains("date:"));
     assert!(output.frontmatter_yaml.contains("created:"));
@@ -350,7 +350,7 @@ fn test_tags_in_body() {
         attendees: None,
     };
 
-    let output = baez::to_markdown(&raw, &meta, "doc1", None, None).unwrap();
+    let output = baez::to_markdown(&raw, &meta, "doc1", None, None, vec![], None).unwrap();
     assert!(output.body.contains("#granola"));
     assert!(output.body.contains("#meeting/sprint-review"));
 }
@@ -385,10 +385,10 @@ fn test_empty_last_viewed_panel_no_notes_section() {
         attendees: None,
     };
 
-    let output = baez::to_markdown(&raw, &meta, "doc-empty-panel", None, None).unwrap();
+    let output = baez::to_markdown(&raw, &meta, "doc-empty-panel", None, None, vec![], None).unwrap();
     assert!(!output.body.contains("## Notes"));
 
-    let output = baez::to_markdown(&raw, &meta, "doc-empty-panel", Some(""), None).unwrap();
+    let output = baez::to_markdown(&raw, &meta, "doc-empty-panel", Some(""), None, vec![], None).unwrap();
     assert!(!output.body.contains("## Notes"));
 }
 
@@ -422,9 +422,9 @@ fn test_empty_summary_text_no_summary_section() {
         attendees: None,
     };
 
-    let output = baez::to_markdown(&raw, &meta, "doc-empty-summary", None, None).unwrap();
+    let output = baez::to_markdown(&raw, &meta, "doc-empty-summary", None, None, vec![], None).unwrap();
     assert!(!output.body.contains("## Summary"));
 
-    let output = baez::to_markdown(&raw, &meta, "doc-empty-summary", None, Some("")).unwrap();
+    let output = baez::to_markdown(&raw, &meta, "doc-empty-summary", None, Some(""), vec![], None).unwrap();
     assert!(!output.body.contains("## Summary"));
 }

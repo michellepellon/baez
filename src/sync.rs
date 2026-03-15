@@ -192,6 +192,8 @@ pub fn sync_all(
             &doc_summary.id,
             notes_md.as_deref(),
             summary_text.as_deref(),
+            vec![],
+            None,
         )?;
 
         let full_md = format!("---\n{}---\n\n{}", md.frontmatter_yaml, md.body);

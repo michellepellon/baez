@@ -67,7 +67,7 @@ fn run() -> Result<()> {
             let base_filename = format!("{}_{}", date, slug);
 
             // Convert to markdown (notes/summary fetched only during sync)
-            let md = baez::convert::to_markdown(&transcript, &meta, id, None, None)?;
+            let md = baez::convert::to_markdown(&transcript, &meta, id, None, None, vec![], None)?;
             let full_md = format!("---\n{}---\n\n{}", md.frontmatter_yaml, md.body);
 
             // Write files: save verbatim API responses as raw JSON
