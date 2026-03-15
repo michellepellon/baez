@@ -221,6 +221,11 @@ mod timestamp_tests {
     }
 }
 
+/// Compute Levenshtein edit distance between two strings.
+pub fn levenshtein_distance(a: &str, b: &str) -> usize {
+    strsim::levenshtein(a, b)
+}
+
 #[cfg(test)]
 mod triage_tests {
     use super::*;
@@ -279,5 +284,30 @@ mod triage_tests {
             ],
         };
         assert_eq!(count_transcript_words(&t), 5);
+    }
+}
+
+#[cfg(test)]
+mod levenshtein_tests {
+    use super::*;
+
+    #[test]
+    fn test_identical_strings() {
+        assert_eq!(levenshtein_distance("alice", "alice"), 0);
+    }
+
+    #[test]
+    fn test_one_edit() {
+        assert_eq!(levenshtein_distance("alice", "alce"), 1);
+    }
+
+    #[test]
+    fn test_two_edits() {
+        assert_eq!(levenshtein_distance("smith", "smyth"), 1);
+    }
+
+    #[test]
+    fn test_completely_different() {
+        assert!(levenshtein_distance("alice", "bob") > 2);
     }
 }
