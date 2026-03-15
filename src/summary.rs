@@ -89,6 +89,81 @@ impl SummaryConfig {
     }
 }
 
+/// Entities extracted from a Claude summary for vault knowledge graph updates.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExtractedEntities {
+    #[serde(default)]
+    pub people: Vec<PersonEntity>,
+    #[serde(default)]
+    pub concepts: Vec<ConceptEntity>,
+    #[serde(default)]
+    pub projects: Vec<ProjectEntity>,
+}
+
+/// A person mentioned in a meeting transcript.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PersonEntity {
+    pub name: String,
+    #[serde(default)]
+    pub role: Option<String>,
+    #[serde(default)]
+    pub company: Option<String>,
+    #[serde(default)]
+    pub aliases: Vec<String>,
+    #[serde(default)]
+    pub context: String,
+}
+
+/// A reusable concept or insight extracted from a meeting.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConceptEntity {
+    pub name: String,
+    pub description: String,
+    #[serde(default)]
+    pub existing: bool,
+}
+
+/// A project mentioned in a meeting.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProjectEntity {
+    pub name: String,
+    pub description: String,
+    #[serde(default)]
+    pub existing: bool,
+}
+
+const ENTITY_MARKER_START: &str = "<!-- baez-entities";
+const ENTITY_MARKER_END: &str = "-->";
+
+/// Separate markdown summary from the JSON entity block.
+///
+/// Returns (clean_markdown, optional_entities). Parsing failures are non-fatal:
+/// if the JSON block is missing or malformed, returns the full text as markdown
+/// with `None` for entities.
+pub fn parse_summary_output(raw: &str) -> (String, Option<ExtractedEntities>) {
+    let Some(marker_start) = raw.find(ENTITY_MARKER_START) else {
+        return (raw.to_string(), None);
+    };
+
+    let markdown = raw[..marker_start].trim_end().to_string();
+
+    let json_start = marker_start + ENTITY_MARKER_START.len();
+    let Some(marker_end) = raw[json_start..].find(ENTITY_MARKER_END) else {
+        eprintln!("Warning: Found baez-entities marker but no closing -->");
+        return (raw.to_string(), None);
+    };
+
+    let json_str = raw[json_start..json_start + marker_end].trim();
+
+    match serde_json::from_str::<ExtractedEntities>(json_str) {
+        Ok(entities) => (markdown, Some(entities)),
+        Err(e) => {
+            eprintln!("Warning: Failed to parse baez-entities JSON: {}", e);
+            (markdown, None)
+        }
+    }
+}
+
 /// Format a raw transcript into plain text suitable for LLM input.
 /// Includes a metadata header (title, date, duration, participants) followed by
 /// `Speaker (HH:MM:SS): text` lines.
@@ -591,5 +666,83 @@ mod tests {
         // With no env var and no keychain, get_api_key returns None (on non-macOS)
         // On macOS it may try keychain — just ensure it doesn't panic
         let _ = get_api_key();
+    }
+}
+
+#[cfg(test)]
+mod parse_tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_valid_markdown_and_json() {
+        let input = r#"## Summary
+- Point one
+- Point two
+
+## People
+| [[Alice Smith]] | Engineer |
+
+<!-- baez-entities
+{
+  "people": [{"name": "Alice Smith", "role": "Engineer", "company": "Acme", "aliases": ["Alice"], "context": "Led discussion"}],
+  "concepts": [{"name": "API Design", "description": "Building APIs first", "existing": false}],
+  "projects": []
+}
+-->"#;
+
+        let (markdown, entities) = parse_summary_output(input);
+
+        assert!(markdown.contains("## Summary"));
+        assert!(markdown.contains("## People"));
+        assert!(!markdown.contains("baez-entities"));
+        assert!(!markdown.contains("-->"));
+
+        let entities = entities.unwrap();
+        assert_eq!(entities.people.len(), 1);
+        assert_eq!(entities.people[0].name, "Alice Smith");
+        assert_eq!(entities.people[0].role.as_deref(), Some("Engineer"));
+        assert_eq!(entities.people[0].aliases, vec!["Alice"]);
+        assert_eq!(entities.concepts.len(), 1);
+        assert_eq!(entities.concepts[0].name, "API Design");
+        assert!(!entities.concepts[0].existing);
+        assert!(entities.projects.is_empty());
+    }
+
+    #[test]
+    fn test_parse_no_json_block() {
+        let input = "## Summary\n- Just markdown\n\n## Notes\nSome notes.";
+        let (markdown, entities) = parse_summary_output(input);
+        assert_eq!(markdown, input);
+        assert!(entities.is_none());
+    }
+
+    #[test]
+    fn test_parse_malformed_json() {
+        let input = "## Summary\n\n<!-- baez-entities\n{invalid json\n-->";
+        let (markdown, entities) = parse_summary_output(input);
+        assert!(markdown.contains("## Summary"));
+        assert!(entities.is_none());
+    }
+
+    #[test]
+    fn test_parse_empty_entities() {
+        let input = r#"## Summary
+
+<!-- baez-entities
+{"people": [], "concepts": [], "projects": []}
+-->"#;
+        let (markdown, entities) = parse_summary_output(input);
+        assert!(markdown.contains("## Summary"));
+        let entities = entities.unwrap();
+        assert!(entities.people.is_empty());
+        assert!(entities.concepts.is_empty());
+        assert!(entities.projects.is_empty());
+    }
+
+    #[test]
+    fn test_parse_strips_trailing_whitespace() {
+        let input = "## Summary\n- Point\n\n<!-- baez-entities\n{\"people\": [], \"concepts\": [], \"projects\": []}\n-->\n";
+        let (markdown, _) = parse_summary_output(input);
+        assert!(!markdown.contains("baez-entities"));
     }
 }
