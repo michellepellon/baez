@@ -477,14 +477,15 @@ mod tests {
         )
         .unwrap();
 
-        assert!(output
-            .body
-            .contains("We discussed project priorities."));
+        assert!(output.body.contains("We discussed project priorities."));
         assert!(output
             .body
             .contains("## Notes\n\n- Action item 1\n- Action item 2"));
         assert!(output.body.contains("---\n"));
-        let summary_pos = output.body.find("We discussed project priorities.").unwrap();
+        let summary_pos = output
+            .body
+            .find("We discussed project priorities.")
+            .unwrap();
         let notes_pos = output.body.find("## Notes").unwrap();
         let separator_pos = output.body.find("---\n").unwrap();
         assert!(summary_pos < notes_pos);

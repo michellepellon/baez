@@ -27,13 +27,13 @@ pub use model::{
 pub use storage::{
     create_concept_note, create_person_note, create_project_note, enrich_concept_note,
     enrich_person_note, enrich_project_note, find_entity_file, read_entity_frontmatter,
-    read_frontmatter, write_atomic, PeopleIndex, Paths,
+    read_frontmatter, write_atomic, Paths, PeopleIndex,
 };
 pub use sync::sync_all;
 pub use util::count_transcript_words;
 
 #[cfg(feature = "summaries")]
 pub use summary::{
-    build_context_preamble, parse_summary_output, ExtractedEntities, PersonEntity, ConceptEntity,
+    build_context_preamble, parse_summary_output, ConceptEntity, ExtractedEntities, PersonEntity,
     ProjectEntity,
 };

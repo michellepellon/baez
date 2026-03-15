@@ -260,7 +260,10 @@ mod triage_tests {
 
     #[test]
     fn test_substantive_transcript() {
-        let words: String = (0..25).map(|i| format!("word{}", i)).collect::<Vec<_>>().join(" ");
+        let words: String = (0..25)
+            .map(|i| format!("word{}", i))
+            .collect::<Vec<_>>()
+            .join(" ");
         let t = RawTranscript {
             entries: vec![make_entry(&words)],
         };
@@ -278,10 +281,7 @@ mod triage_tests {
     #[test]
     fn test_multiple_entries_summed() {
         let t = RawTranscript {
-            entries: vec![
-                make_entry("one two three"),
-                make_entry("four five"),
-            ],
+            entries: vec![make_entry("one two three"), make_entry("four five")],
         };
         assert_eq!(count_transcript_words(&t), 5);
     }

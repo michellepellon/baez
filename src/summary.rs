@@ -589,7 +589,7 @@ pub fn build_context_preamble(vault_dir: &std::path::Path) -> String {
     if let Some(names) = scan_entity_dir(&vault_dir.join("Projects")) {
         if !names.is_empty() {
             let mut section = String::from(
-                "Existing projects in the vault (reference by exact name if relevant):\n"
+                "Existing projects in the vault (reference by exact name if relevant):\n",
             );
             for name in &names {
                 section.push_str(&format!("- {}\n", name));
