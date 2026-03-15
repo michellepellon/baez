@@ -569,6 +569,63 @@ fn chunk_transcript(text: &str, max_chars: usize) -> Vec<String> {
     chunks
 }
 
+/// Scan Concepts/ and Projects/ directories for existing entity names.
+/// Returns a prompt preamble string listing them for Claude to reference.
+pub fn build_context_preamble(vault_dir: &std::path::Path) -> String {
+    let mut sections = Vec::new();
+
+    if let Some(names) = scan_entity_dir(&vault_dir.join("Concepts")) {
+        if !names.is_empty() {
+            let mut section = String::from(
+                "Existing concepts in the vault (reference by exact name if relevant, only propose new ones if genuinely distinct):\n"
+            );
+            for name in &names {
+                section.push_str(&format!("- {}\n", name));
+            }
+            sections.push(section);
+        }
+    }
+
+    if let Some(names) = scan_entity_dir(&vault_dir.join("Projects")) {
+        if !names.is_empty() {
+            let mut section = String::from(
+                "Existing projects in the vault (reference by exact name if relevant):\n"
+            );
+            for name in &names {
+                section.push_str(&format!("- {}\n", name));
+            }
+            sections.push(section);
+        }
+    }
+
+    sections.join("\n")
+}
+
+/// Scan a directory for .md files and return their filename stems.
+fn scan_entity_dir(dir: &std::path::Path) -> Option<Vec<String>> {
+    if !dir.is_dir() {
+        return None;
+    }
+
+    let mut names: Vec<String> = std::fs::read_dir(dir)
+        .ok()?
+        .filter_map(|e| e.ok())
+        .filter_map(|e| {
+            let path = e.path();
+            if path.extension().and_then(|s| s.to_str()) == Some("md") {
+                path.file_stem()
+                    .and_then(|s| s.to_str())
+                    .map(|s| s.to_string())
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    names.sort();
+    Some(names)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -814,5 +871,53 @@ mod parse_tests {
         let input = "## Summary\n- Point\n\n<!-- baez-entities\n{\"people\": [], \"concepts\": [], \"projects\": []}\n-->\n";
         let (markdown, _) = parse_summary_output(input);
         assert!(!markdown.contains("baez-entities"));
+    }
+}
+
+#[cfg(test)]
+mod context_tests {
+    use super::*;
+
+    #[test]
+    fn test_build_context_preamble_empty() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let result = build_context_preamble(temp.path());
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_build_context_preamble_with_concepts_and_projects() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let concepts_dir = temp.path().join("Concepts");
+        let projects_dir = temp.path().join("Projects");
+        std::fs::create_dir_all(&concepts_dir).unwrap();
+        std::fs::create_dir_all(&projects_dir).unwrap();
+
+        std::fs::write(concepts_dir.join("API Design.md"), "# API Design").unwrap();
+        std::fs::write(concepts_dir.join("Conway's Law.md"), "# Conway's Law").unwrap();
+        std::fs::write(projects_dir.join("Project Atlas.md"), "# Project Atlas").unwrap();
+
+        let result = build_context_preamble(temp.path());
+        assert!(result.contains("Existing concepts"));
+        assert!(result.contains("- API Design"));
+        assert!(result.contains("- Conway's Law"));
+        assert!(result.contains("Existing projects"));
+        assert!(result.contains("- Project Atlas"));
+    }
+
+    #[test]
+    fn test_build_context_preamble_ignores_non_md_files() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let concepts_dir = temp.path().join("Concepts");
+        std::fs::create_dir_all(&concepts_dir).unwrap();
+
+        std::fs::write(concepts_dir.join("Real Concept.md"), "").unwrap();
+        std::fs::write(concepts_dir.join(".DS_Store"), "").unwrap();
+        std::fs::write(concepts_dir.join("notes.txt"), "").unwrap();
+
+        let result = build_context_preamble(temp.path());
+        assert!(result.contains("- Real Concept"));
+        assert!(!result.contains(".DS_Store"));
+        assert!(!result.contains("notes"));
     }
 }
