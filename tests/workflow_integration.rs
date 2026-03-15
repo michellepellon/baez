@@ -451,6 +451,7 @@ fn test_empty_summary_text_no_summary_section() {
 }
 
 /// Test: parse_summary_output strips entity JSON and returns clean markdown
+#[cfg(feature = "summaries")]
 #[test]
 fn test_summary_output_parsing_integration() {
     let raw = r#"## Summary
@@ -507,7 +508,16 @@ fn test_to_markdown_with_related_and_status() {
     };
 
     let related = vec!["[[Alice Smith]]".into(), "[[API Design]]".into()];
-    let output = baez::to_markdown(&raw, &meta, "doc1", None, None, related, Some("substantive")).unwrap();
+    let output = baez::to_markdown(
+        &raw,
+        &meta,
+        "doc1",
+        None,
+        None,
+        related,
+        Some("substantive"),
+    )
+    .unwrap();
 
     assert!(output.frontmatter_yaml.contains("related:"));
     assert!(output.frontmatter_yaml.contains("[[Alice Smith]]"));
@@ -533,7 +543,10 @@ fn test_triage_stub_classification() {
     };
     assert!(baez::count_transcript_words(&stub) < 20);
 
-    let substantive_text = (0..25).map(|i| format!("word{}", i)).collect::<Vec<_>>().join(" ");
+    let substantive_text = (0..25)
+        .map(|i| format!("word{}", i))
+        .collect::<Vec<_>>()
+        .join(" ");
     let substantive = RawTranscript {
         entries: vec![TranscriptEntry {
             document_id: None,
@@ -568,19 +581,37 @@ fn test_entity_note_creation_integration() {
 
     // Create entities
     baez::create_person_note(
-        &people_dir, "Alice Smith", Some("Engineer"), Some("Acme"),
-        &["Alice"], "Led discussion", "2025-01-15_standup", "2025-01-15", &tmp_dir,
-    ).unwrap();
+        &people_dir,
+        "Alice Smith",
+        Some("Engineer"),
+        Some("Acme"),
+        &["Alice"],
+        "Led discussion",
+        "2025-01-15_standup",
+        "2025-01-15",
+        &tmp_dir,
+    )
+    .unwrap();
 
     baez::create_concept_note(
-        &concepts_dir, "API Design", "Building APIs first",
-        "2025-01-15_standup", "2025-01-15", &tmp_dir,
-    ).unwrap();
+        &concepts_dir,
+        "API Design",
+        "Building APIs first",
+        "2025-01-15_standup",
+        "2025-01-15",
+        &tmp_dir,
+    )
+    .unwrap();
 
     baez::create_project_note(
-        &projects_dir, "Project Atlas", "Migration tool",
-        "2025-01-15_standup", "2025-01-15", &tmp_dir,
-    ).unwrap();
+        &projects_dir,
+        "Project Atlas",
+        "Migration tool",
+        "2025-01-15_standup",
+        "2025-01-15",
+        &tmp_dir,
+    )
+    .unwrap();
 
     // Verify files exist with correct content
     assert!(people_dir.join("Alice Smith.md").exists());
@@ -594,8 +625,13 @@ fn test_entity_note_creation_integration() {
     // Enrich the person note
     baez::enrich_person_note(
         &people_dir.join("Alice Smith.md"),
-        &["AS"], "Reviewed migration plan", "2025-01-20_planning", "2025-01-20", &tmp_dir,
-    ).unwrap();
+        &["AS"],
+        "Reviewed migration plan",
+        "2025-01-20_planning",
+        "2025-01-20",
+        &tmp_dir,
+    )
+    .unwrap();
 
     let enriched = fs::read_to_string(people_dir.join("Alice Smith.md")).unwrap();
     assert!(enriched.contains("[[2025-01-15_standup]]"));
