@@ -88,6 +88,8 @@ pub fn to_markdown(
         attendees: attendee_names.clone(),
         duration_minutes,
         tags,
+        related: vec![],
+        status: None,
         generator: "baez".into(),
     };
 
