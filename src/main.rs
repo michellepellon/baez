@@ -67,7 +67,7 @@ fn run() -> Result<()> {
             let base_filename = format!("{}_{}", date, slug);
 
             // Convert to markdown (notes/summary fetched only during sync)
-            let md = baez::convert::to_markdown(&transcript, &meta, id, None, None)?;
+            let md = baez::convert::to_markdown(&transcript, &meta, id, None, None, vec![], None)?;
             let full_md = format!("---\n{}---\n\n{}", md.frontmatter_yaml, md.body);
 
             // Write files: save verbatim API responses as raw JSON
@@ -234,8 +234,9 @@ fn run() -> Result<()> {
                 "Summarizing with {} (max input: {} chars)...",
                 config.model, config.max_input_chars
             );
-            let summary =
-                baez::summary::summarize_transcript(&input, &api_key, &config, &claude_client)?;
+            let raw_summary =
+                baez::summary::summarize_transcript(&input, &api_key, &config, &claude_client, "")?;
+            let (summary, _entities) = baez::summary::parse_summary_output(&raw_summary);
 
             if save {
                 let content = std::fs::read_to_string(&md_path)?;

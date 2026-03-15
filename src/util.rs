@@ -18,6 +18,16 @@ pub fn slugify(text: &str) -> String {
     }
 }
 
+/// Count the total number of words across all transcript entries.
+/// Used for triage: transcripts with < 20 words are classified as stubs.
+pub fn count_transcript_words(transcript: &crate::model::RawTranscript) -> usize {
+    transcript
+        .entries
+        .iter()
+        .map(|e| e.text.split_whitespace().count())
+        .sum()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -208,5 +218,96 @@ mod timestamp_tests {
     fn test_normalize_timestamp_legacy_string() {
         let ts = TimestampValue::String("00:12:34.567".into());
         assert_eq!(normalize_timestamp_legacy(&ts), Some("00:12:34".into()));
+    }
+}
+
+/// Compute Levenshtein edit distance between two strings.
+pub fn levenshtein_distance(a: &str, b: &str) -> usize {
+    strsim::levenshtein(a, b)
+}
+
+#[cfg(test)]
+mod triage_tests {
+    use super::*;
+    use crate::model::{RawTranscript, TranscriptEntry};
+
+    fn make_entry(text: &str) -> TranscriptEntry {
+        TranscriptEntry {
+            document_id: None,
+            speaker: None,
+            start: None,
+            end: None,
+            text: text.into(),
+            source: None,
+            id: None,
+            is_final: None,
+        }
+    }
+
+    #[test]
+    fn test_empty_transcript() {
+        let t = RawTranscript { entries: vec![] };
+        assert_eq!(count_transcript_words(&t), 0);
+    }
+
+    #[test]
+    fn test_stub_transcript() {
+        let t = RawTranscript {
+            entries: vec![make_entry("hello world")],
+        };
+        assert_eq!(count_transcript_words(&t), 2);
+    }
+
+    #[test]
+    fn test_substantive_transcript() {
+        let words: String = (0..25)
+            .map(|i| format!("word{}", i))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let t = RawTranscript {
+            entries: vec![make_entry(&words)],
+        };
+        assert_eq!(count_transcript_words(&t), 25);
+    }
+
+    #[test]
+    fn test_whitespace_only_entries() {
+        let t = RawTranscript {
+            entries: vec![make_entry("   "), make_entry(""), make_entry("\n\t")],
+        };
+        assert_eq!(count_transcript_words(&t), 0);
+    }
+
+    #[test]
+    fn test_multiple_entries_summed() {
+        let t = RawTranscript {
+            entries: vec![make_entry("one two three"), make_entry("four five")],
+        };
+        assert_eq!(count_transcript_words(&t), 5);
+    }
+}
+
+#[cfg(test)]
+mod levenshtein_tests {
+    use super::*;
+
+    #[test]
+    fn test_identical_strings() {
+        assert_eq!(levenshtein_distance("alice", "alice"), 0);
+    }
+
+    #[test]
+    fn test_one_edit() {
+        assert_eq!(levenshtein_distance("alice", "alce"), 1);
+    }
+
+    #[test]
+    fn test_two_edits() {
+        assert_eq!(levenshtein_distance("smith", "smyth"), 1);
+    }
+
+    #[test]
+    fn test_completely_different() {
+        assert!(levenshtein_distance("alice", "bob") > 2);
     }
 }

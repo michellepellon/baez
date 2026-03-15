@@ -220,16 +220,25 @@ fn test_notes_and_summary_in_markdown() {
     let notes_md = "- Follow up on deployment\n- Review PR #42";
     let summary = "Discussed deployment timeline and code review process.";
 
-    let output = baez::to_markdown(&raw, &meta, "doc-test", Some(notes_md), Some(summary)).unwrap();
+    let output = baez::to_markdown(
+        &raw,
+        &meta,
+        "doc-test",
+        Some(notes_md),
+        Some(summary),
+        vec![],
+        None,
+    )
+    .unwrap();
 
     assert!(output
         .body
-        .contains("## Summary\n\nDiscussed deployment timeline and code review process."),);
+        .contains("Discussed deployment timeline and code review process."),);
     assert!(output
         .body
         .contains("## Notes\n\n- Follow up on deployment\n- Review PR #42"),);
 
-    let summary_pos = output.body.find("## Summary").unwrap();
+    let summary_pos = output.body.find("Discussed deployment timeline").unwrap();
     let notes_pos = output.body.find("## Notes").unwrap();
     let separator_pos = output.body.find("---\n").unwrap();
     let transcript_pos = output.body.find("**[[Alice]]").unwrap();
@@ -269,7 +278,7 @@ fn test_wiki_links_in_transcript() {
         attendees: None,
     };
 
-    let output = baez::to_markdown(&raw, &meta, "doc1", None, None).unwrap();
+    let output = baez::to_markdown(&raw, &meta, "doc1", None, None, vec![], None).unwrap();
     assert!(
         output.body.contains("**[[Alice]]"),
         "Speaker should be wiki-linked"
@@ -310,7 +319,7 @@ fn test_dataview_frontmatter() {
         attendees: None,
     };
 
-    let output = baez::to_markdown(&raw, &meta, "doc1", None, None).unwrap();
+    let output = baez::to_markdown(&raw, &meta, "doc1", None, None, vec![], None).unwrap();
 
     assert!(output.frontmatter_yaml.contains("date:"));
     assert!(output.frontmatter_yaml.contains("created:"));
@@ -350,7 +359,7 @@ fn test_tags_in_body() {
         attendees: None,
     };
 
-    let output = baez::to_markdown(&raw, &meta, "doc1", None, None).unwrap();
+    let output = baez::to_markdown(&raw, &meta, "doc1", None, None, vec![], None).unwrap();
     assert!(output.body.contains("#granola"));
     assert!(output.body.contains("#meeting/sprint-review"));
 }
@@ -385,10 +394,12 @@ fn test_empty_last_viewed_panel_no_notes_section() {
         attendees: None,
     };
 
-    let output = baez::to_markdown(&raw, &meta, "doc-empty-panel", None, None).unwrap();
+    let output =
+        baez::to_markdown(&raw, &meta, "doc-empty-panel", None, None, vec![], None).unwrap();
     assert!(!output.body.contains("## Notes"));
 
-    let output = baez::to_markdown(&raw, &meta, "doc-empty-panel", Some(""), None).unwrap();
+    let output =
+        baez::to_markdown(&raw, &meta, "doc-empty-panel", Some(""), None, vec![], None).unwrap();
     assert!(!output.body.contains("## Notes"));
 }
 
@@ -422,9 +433,208 @@ fn test_empty_summary_text_no_summary_section() {
         attendees: None,
     };
 
-    let output = baez::to_markdown(&raw, &meta, "doc-empty-summary", None, None).unwrap();
+    let output =
+        baez::to_markdown(&raw, &meta, "doc-empty-summary", None, None, vec![], None).unwrap();
     assert!(!output.body.contains("## Summary"));
 
-    let output = baez::to_markdown(&raw, &meta, "doc-empty-summary", None, Some("")).unwrap();
+    let output = baez::to_markdown(
+        &raw,
+        &meta,
+        "doc-empty-summary",
+        None,
+        Some(""),
+        vec![],
+        None,
+    )
+    .unwrap();
     assert!(!output.body.contains("## Summary"));
+}
+
+/// Test: parse_summary_output strips entity JSON and returns clean markdown
+#[cfg(feature = "summaries")]
+#[test]
+fn test_summary_output_parsing_integration() {
+    let raw = r#"## Summary
+- Key point
+
+## People
+| [[Alice]] | Engineer |
+
+<!-- baez-entities
+{"people": [{"name": "Alice Smith", "role": "Engineer", "company": "Acme", "aliases": ["Alice"], "context": "Led discussion"}], "concepts": [{"name": "API Design", "description": "Building APIs first", "existing": false}], "projects": []}
+-->"#;
+
+    let (markdown, entities) = baez::summary::parse_summary_output(raw);
+
+    // Markdown is clean
+    assert!(markdown.contains("## Summary"));
+    assert!(!markdown.contains("baez-entities"));
+
+    // Entities are parsed
+    let entities = entities.unwrap();
+    assert_eq!(entities.people.len(), 1);
+    assert_eq!(entities.people[0].name, "Alice Smith");
+    assert_eq!(entities.concepts.len(), 1);
+}
+
+/// Test: to_markdown with related and status produces correct frontmatter
+#[test]
+fn test_to_markdown_with_related_and_status() {
+    use baez::model::{DocumentMetadata, RawTranscript, TranscriptEntry};
+
+    let raw = RawTranscript {
+        entries: vec![TranscriptEntry {
+            document_id: None,
+            speaker: Some("Alice".into()),
+            start: None,
+            end: None,
+            text: "Hello".into(),
+            source: None,
+            id: None,
+            is_final: None,
+        }],
+    };
+
+    let meta = DocumentMetadata {
+        id: Some("doc1".into()),
+        title: Some("Meeting".into()),
+        created_at: "2025-12-01T09:00:00Z".parse().unwrap(),
+        updated_at: None,
+        participants: vec!["Alice".into()],
+        duration_seconds: None,
+        labels: vec![],
+        creator: None,
+        attendees: None,
+    };
+
+    let related = vec!["[[Alice Smith]]".into(), "[[API Design]]".into()];
+    let output = baez::to_markdown(
+        &raw,
+        &meta,
+        "doc1",
+        None,
+        None,
+        related,
+        Some("substantive"),
+    )
+    .unwrap();
+
+    assert!(output.frontmatter_yaml.contains("related:"));
+    assert!(output.frontmatter_yaml.contains("[[Alice Smith]]"));
+    assert!(output.frontmatter_yaml.contains("status: substantive"));
+}
+
+/// Test: triage classifies short transcripts as stubs
+#[test]
+fn test_triage_stub_classification() {
+    use baez::model::{RawTranscript, TranscriptEntry};
+
+    let stub = RawTranscript {
+        entries: vec![TranscriptEntry {
+            document_id: None,
+            speaker: None,
+            start: None,
+            end: None,
+            text: "hello world".into(),
+            source: None,
+            id: None,
+            is_final: None,
+        }],
+    };
+    assert!(baez::count_transcript_words(&stub) < 20);
+
+    let substantive_text = (0..25)
+        .map(|i| format!("word{}", i))
+        .collect::<Vec<_>>()
+        .join(" ");
+    let substantive = RawTranscript {
+        entries: vec![TranscriptEntry {
+            document_id: None,
+            speaker: None,
+            start: None,
+            end: None,
+            text: substantive_text,
+            source: None,
+            id: None,
+            is_final: None,
+        }],
+    };
+    assert!(baez::count_transcript_words(&substantive) >= 20);
+}
+
+/// Test: entity note creation with tempdir
+#[test]
+fn test_entity_note_creation_integration() {
+    use std::fs;
+    use tempfile::TempDir;
+
+    let temp = TempDir::new().unwrap();
+    let people_dir = temp.path().join("People");
+    let concepts_dir = temp.path().join("Concepts");
+    let projects_dir = temp.path().join("Projects");
+    let tmp_dir = temp.path().join("tmp");
+
+    fs::create_dir_all(&people_dir).unwrap();
+    fs::create_dir_all(&concepts_dir).unwrap();
+    fs::create_dir_all(&projects_dir).unwrap();
+    fs::create_dir_all(&tmp_dir).unwrap();
+
+    // Create entities
+    baez::create_person_note(
+        &people_dir,
+        "Alice Smith",
+        Some("Engineer"),
+        Some("Acme"),
+        &["Alice"],
+        "Led discussion",
+        "2025-01-15_standup",
+        "2025-01-15",
+        &tmp_dir,
+    )
+    .unwrap();
+
+    baez::create_concept_note(
+        &concepts_dir,
+        "API Design",
+        "Building APIs first",
+        "2025-01-15_standup",
+        "2025-01-15",
+        &tmp_dir,
+    )
+    .unwrap();
+
+    baez::create_project_note(
+        &projects_dir,
+        "Project Atlas",
+        "Migration tool",
+        "2025-01-15_standup",
+        "2025-01-15",
+        &tmp_dir,
+    )
+    .unwrap();
+
+    // Verify files exist with correct content
+    assert!(people_dir.join("Alice Smith.md").exists());
+    assert!(concepts_dir.join("API Design.md").exists());
+    assert!(projects_dir.join("Project Atlas.md").exists());
+
+    let people_content = fs::read_to_string(people_dir.join("Alice Smith.md")).unwrap();
+    assert!(people_content.contains("[[2025-01-15_standup]]"));
+    assert!(people_content.contains("Led discussion"));
+
+    // Enrich the person note
+    baez::enrich_person_note(
+        &people_dir.join("Alice Smith.md"),
+        &["AS"],
+        "Reviewed migration plan",
+        "2025-01-20_planning",
+        "2025-01-20",
+        &tmp_dir,
+    )
+    .unwrap();
+
+    let enriched = fs::read_to_string(people_dir.join("Alice Smith.md")).unwrap();
+    assert!(enriched.contains("[[2025-01-15_standup]]"));
+    assert!(enriched.contains("[[2025-01-20_planning]]"));
+    assert!(enriched.contains("Reviewed migration plan"));
 }

@@ -53,6 +53,8 @@ pub fn to_markdown(
     doc_id: &str,
     notes: Option<&str>,
     summary_text: Option<&str>,
+    related: Vec<String>,
+    status: Option<&str>,
 ) -> Result<MarkdownOutput> {
     // Flatten attendee names for frontmatter
     let attendee_names: Vec<String> = if let Some(ref rich_attendees) = meta.attendees {
@@ -88,6 +90,8 @@ pub fn to_markdown(
         attendees: attendee_names.clone(),
         duration_minutes,
         tags,
+        related,
+        status: status.map(|s| s.to_string()),
         generator: "baez".into(),
     };
 
@@ -141,9 +145,11 @@ pub fn to_markdown(
     // AI-generated summary section
     if let Some(summary) = summary_text {
         if !summary.is_empty() {
-            body.push_str("## Summary\n\n");
             body.push_str(summary);
-            body.push_str("\n\n");
+            if !summary.ends_with('\n') {
+                body.push('\n');
+            }
+            body.push('\n');
         }
     }
 
@@ -228,7 +234,7 @@ mod tests {
             attendees: None,
         };
 
-        let output = to_markdown(&raw, &meta, "doc123", None, None).unwrap();
+        let output = to_markdown(&raw, &meta, "doc123", None, None, vec![], None).unwrap();
 
         assert!(output.body.contains("# Test Meeting"));
         assert!(output.body.contains("**[[Alice]]"));
@@ -268,7 +274,7 @@ mod tests {
             attendees: None,
         };
 
-        let output = to_markdown(&raw, &meta, "doc123", None, None).unwrap();
+        let output = to_markdown(&raw, &meta, "doc123", None, None, vec![], None).unwrap();
         assert!(output.body.contains("Participants: [[Alice]], [[Bob]]"));
     }
 
@@ -299,7 +305,7 @@ mod tests {
             attendees: None,
         };
 
-        let output = to_markdown(&raw, &meta, "doc123", None, None).unwrap();
+        let output = to_markdown(&raw, &meta, "doc123", None, None, vec![], None).unwrap();
         assert!(output.body.contains("#granola"));
         assert!(output.body.contains("#meeting/planning"));
         assert!(output.body.contains("#meeting/sprint-review"));
@@ -336,7 +342,7 @@ mod tests {
             attendees: None,
         };
 
-        let output = to_markdown(&raw, &meta, "doc123", None, None).unwrap();
+        let output = to_markdown(&raw, &meta, "doc123", None, None, vec![], None).unwrap();
 
         // New frontmatter fields
         assert!(output.frontmatter_yaml.contains("date:"));
@@ -400,7 +406,7 @@ mod tests {
             ]),
         };
 
-        let output = to_markdown(&raw, &meta, "doc123", None, None).unwrap();
+        let output = to_markdown(&raw, &meta, "doc123", None, None, vec![], None).unwrap();
 
         assert!(output.body.contains("## Participants"));
         assert!(output
@@ -427,7 +433,7 @@ mod tests {
             attendees: None,
         };
 
-        let output = to_markdown(&raw, &meta, "doc123", None, None).unwrap();
+        let output = to_markdown(&raw, &meta, "doc123", None, None, vec![], None).unwrap();
 
         assert!(output.body.contains("# Untitled Meeting"));
         assert!(output.body.contains("_No transcript content available._"));
@@ -466,17 +472,20 @@ mod tests {
             "doc123",
             Some("- Action item 1\n- Action item 2"),
             Some("We discussed project priorities."),
+            vec![],
+            None,
         )
         .unwrap();
 
-        assert!(output
-            .body
-            .contains("## Summary\n\nWe discussed project priorities."));
+        assert!(output.body.contains("We discussed project priorities."));
         assert!(output
             .body
             .contains("## Notes\n\n- Action item 1\n- Action item 2"));
         assert!(output.body.contains("---\n"));
-        let summary_pos = output.body.find("## Summary").unwrap();
+        let summary_pos = output
+            .body
+            .find("We discussed project priorities.")
+            .unwrap();
         let notes_pos = output.body.find("## Notes").unwrap();
         let separator_pos = output.body.find("---\n").unwrap();
         assert!(summary_pos < notes_pos);
@@ -528,7 +537,7 @@ mod snapshot_tests {
             attendees: None,
         };
 
-        let output = to_markdown(&raw, &meta, "doc456", None, None).unwrap();
+        let output = to_markdown(&raw, &meta, "doc456", None, None, vec![], None).unwrap();
         let full = format!("---\n{}---\n\n{}", output.frontmatter_yaml, output.body);
 
         insta::assert_snapshot!(full);

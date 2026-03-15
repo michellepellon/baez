@@ -16,16 +16,40 @@ Given the transcript below, produce a structured summary with these sections:
 3–7 bullet points capturing the meeting's essence.
 
 ## Key Decisions
-Numbered list of decisions made (or "None").
+Bulleted list of decisions made, each wrapped in a Dataview inline field:
+- [decision:: Approve Q2 budget for infrastructure migration]
+- [decision:: Defer mobile app to Q3]
+If no decisions were made, write "None."
 
 ## Action Items
-- [ ] **[[Owner]]**: Task description *(due: date if mentioned, priority: high/medium/low)*
+Bulleted checklist. Each item uses Dataview inline fields for owner and action, with optional due date and priority:
+- [ ] [owner:: [[Alice Smith]]] [action:: Deploy staging environment by Friday] *(due: 2025-03-20, priority: high)*
+- [ ] [owner:: [[Bob Chen]]] [action:: Update API documentation] *(priority: medium)*
+Owner names must be [[wiki-links]]. Due dates and priorities are optional — only include if mentioned.
 
 ## Discussion Highlights
 Group by topic using ### subheadings. Use [[wiki-links]] for people's names.
 
 ## Open Questions
 Bulleted list of unresolved items.
+
+## People
+Table of all people mentioned with their role/context in this meeting:
+| Person | Role/Context |
+|--------|-------------|
+| [[Alice Smith]] | Engineering Manager, led API discussion |
+
+## Project Ideas
+- [[Project Name]] — what was discussed, potential next steps
+
+## Blog Ideas
+- **Idea title** — why it's worth writing about, angle to take
+
+## Concepts
+- [[Concept Name]] — brief description and why it matters
+
+## Ideas
+- Idea description — enough context to act on later
 
 Rules:
 - Use [[wiki-links]] for all person names (e.g. [[Alice Smith]]).
@@ -34,7 +58,36 @@ Rules:
 - Preserve important names, dates, and numbers accurately.
 - Only use information from the transcript; label any inferences as "(inferred)".
 - Be explicit when something is unclear, missing, or not specified.
-- Ignore small talk; focus on substance."#;
+- Ignore small talk; focus on substance.
+- Use Dataview inline field syntax [field:: value] exactly as shown in the examples above.
+- If a section has no items, write "None." under the heading — do not omit the section.
+
+After the markdown summary, output a machine-readable JSON entity block for automated processing.
+Wrap it in an HTML comment so it does not render in Obsidian:
+
+<!-- baez-entities
+{
+  "people": [
+    {"name": "Full Name", "role": "their role if known", "company": "their company if known", "aliases": ["nickname", "abbreviation"], "context": "one-line context from this meeting"}
+  ],
+  "concepts": [
+    {"name": "Concept Name", "description": "one-line description", "existing": true}
+  ],
+  "projects": [
+    {"name": "Project Name", "description": "one-line description", "existing": false}
+  ]
+}
+-->
+
+Rules for the entity block:
+- Include ALL people mentioned by name (full names only — skip first-name-only references unless you can infer the full name from context).
+- For concepts: set "existing" to true if the concept appears in the provided existing concepts list, false otherwise.
+- For projects: set "existing" to true if the project appears in the provided existing projects list, false otherwise.
+- Only include genuinely reusable concepts, not trivial topics.
+- The JSON must be valid. Use null for missing optional fields (role, company)."#;
+
+/// Simplified prompt for intermediate chunk summaries (no entity extraction).
+const CHUNK_SUMMARY_PROMPT: &str = r#"You are an expert meeting summarizer. Summarize the following transcript chunk into a concise narrative. Focus on key points, decisions, and action items. Use [[wiki-links]] for person names. This is a partial transcript — do not state conclusions about the overall meeting."#;
 
 const CLAUDE_API_URL: &str = "https://api.anthropic.com/v1/messages";
 const ANTHROPIC_VERSION: &str = "2023-06-01";
@@ -55,7 +108,7 @@ impl Default for SummaryConfig {
         Self {
             model: "claude-opus-4-6".to_string(),
             max_input_chars: 600_000, // ~150K tokens
-            max_tokens: 4096,
+            max_tokens: 8192,
             custom_prompt: None,
             temperature: None,
         }
@@ -86,6 +139,81 @@ impl SummaryConfig {
         self.custom_prompt
             .as_deref()
             .unwrap_or(DEFAULT_SUMMARY_PROMPT)
+    }
+}
+
+/// Entities extracted from a Claude summary for vault knowledge graph updates.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExtractedEntities {
+    #[serde(default)]
+    pub people: Vec<PersonEntity>,
+    #[serde(default)]
+    pub concepts: Vec<ConceptEntity>,
+    #[serde(default)]
+    pub projects: Vec<ProjectEntity>,
+}
+
+/// A person mentioned in a meeting transcript.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PersonEntity {
+    pub name: String,
+    #[serde(default)]
+    pub role: Option<String>,
+    #[serde(default)]
+    pub company: Option<String>,
+    #[serde(default)]
+    pub aliases: Vec<String>,
+    #[serde(default)]
+    pub context: String,
+}
+
+/// A reusable concept or insight extracted from a meeting.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConceptEntity {
+    pub name: String,
+    pub description: String,
+    #[serde(default)]
+    pub existing: bool,
+}
+
+/// A project mentioned in a meeting.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProjectEntity {
+    pub name: String,
+    pub description: String,
+    #[serde(default)]
+    pub existing: bool,
+}
+
+const ENTITY_MARKER_START: &str = "<!-- baez-entities";
+const ENTITY_MARKER_END: &str = "-->";
+
+/// Separate markdown summary from the JSON entity block.
+///
+/// Returns (clean_markdown, optional_entities). Parsing failures are non-fatal:
+/// if the JSON block is missing or malformed, returns the full text as markdown
+/// with `None` for entities.
+pub fn parse_summary_output(raw: &str) -> (String, Option<ExtractedEntities>) {
+    let Some(marker_start) = raw.find(ENTITY_MARKER_START) else {
+        return (raw.to_string(), None);
+    };
+
+    let markdown = raw[..marker_start].trim_end().to_string();
+
+    let json_start = marker_start + ENTITY_MARKER_START.len();
+    let Some(marker_end) = raw[json_start..].find(ENTITY_MARKER_END) else {
+        eprintln!("Warning: Found baez-entities marker but no closing -->");
+        return (raw.to_string(), None);
+    };
+
+    let json_str = raw[json_start..json_start + marker_end].trim();
+
+    match serde_json::from_str::<ExtractedEntities>(json_str) {
+        Ok(entities) => (markdown, Some(entities)),
+        Err(e) => {
+            eprintln!("Warning: Failed to parse baez-entities JSON: {}", e);
+            (markdown, None)
+        }
     }
 }
 
@@ -141,21 +269,38 @@ pub fn summarize_transcript(
     api_key: &str,
     config: &SummaryConfig,
     client: &reqwest::blocking::Client,
+    context_preamble: &str,
 ) -> Result<String> {
     let chunks = chunk_transcript(transcript_text, config.max_input_chars);
 
     if chunks.len() > 1 {
+        // Multi-chunk: use simplified prompt for intermediate summaries
+        let chunk_config = SummaryConfig {
+            custom_prompt: Some(CHUNK_SUMMARY_PROMPT.to_string()),
+            ..config.clone()
+        };
         let mut chunk_summaries = Vec::new();
         for (i, chunk) in chunks.iter().enumerate() {
             println!("Summarizing chunk {}/{}...", i + 1, chunks.len());
-            let summary = call_claude_api(client, chunk, api_key, config)?;
+            let summary = call_claude_api(client, chunk, api_key, &chunk_config)?;
             chunk_summaries.push(summary);
         }
-        // Combine summaries into a single final summary
-        let combined = chunk_summaries.join("\n\n---\n\n");
+        // Final pass: combine chunk summaries with full prompt + context preamble
+        let combined = format!(
+            "{}\n\nCombined meeting summary from {} chunks:\n\n{}",
+            context_preamble,
+            chunks.len(),
+            chunk_summaries.join("\n\n---\n\n")
+        );
         call_claude_api(client, &combined, api_key, config)
     } else {
-        call_claude_api(client, &chunks[0], api_key, config)
+        // Single chunk: full prompt with context preamble
+        let input = if context_preamble.is_empty() {
+            chunks[0].clone()
+        } else {
+            format!("{}\n\n{}", context_preamble, &chunks[0])
+        };
+        call_claude_api(client, &input, api_key, config)
     }
 }
 
@@ -424,6 +569,63 @@ fn chunk_transcript(text: &str, max_chars: usize) -> Vec<String> {
     chunks
 }
 
+/// Scan Concepts/ and Projects/ directories for existing entity names.
+/// Returns a prompt preamble string listing them for Claude to reference.
+pub fn build_context_preamble(vault_dir: &std::path::Path) -> String {
+    let mut sections = Vec::new();
+
+    if let Some(names) = scan_entity_dir(&vault_dir.join("Concepts")) {
+        if !names.is_empty() {
+            let mut section = String::from(
+                "Existing concepts in the vault (reference by exact name if relevant, only propose new ones if genuinely distinct):\n"
+            );
+            for name in &names {
+                section.push_str(&format!("- {}\n", name));
+            }
+            sections.push(section);
+        }
+    }
+
+    if let Some(names) = scan_entity_dir(&vault_dir.join("Projects")) {
+        if !names.is_empty() {
+            let mut section = String::from(
+                "Existing projects in the vault (reference by exact name if relevant):\n",
+            );
+            for name in &names {
+                section.push_str(&format!("- {}\n", name));
+            }
+            sections.push(section);
+        }
+    }
+
+    sections.join("\n")
+}
+
+/// Scan a directory for .md files and return their filename stems.
+fn scan_entity_dir(dir: &std::path::Path) -> Option<Vec<String>> {
+    if !dir.is_dir() {
+        return None;
+    }
+
+    let mut names: Vec<String> = std::fs::read_dir(dir)
+        .ok()?
+        .filter_map(|e| e.ok())
+        .filter_map(|e| {
+            let path = e.path();
+            if path.extension().and_then(|s| s.to_str()) == Some("md") {
+                path.file_stem()
+                    .and_then(|s| s.to_str())
+                    .map(|s| s.to_string())
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    names.sort();
+    Some(names)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -461,7 +663,7 @@ mod tests {
         let config = SummaryConfig::default();
         assert_eq!(config.model, "claude-opus-4-6");
         assert_eq!(config.max_input_chars, 600_000);
-        assert_eq!(config.max_tokens, 4096);
+        assert_eq!(config.max_tokens, 8192);
         assert!(config.custom_prompt.is_none());
         assert!(config.temperature.is_none());
     }
@@ -591,5 +793,131 @@ mod tests {
         // With no env var and no keychain, get_api_key returns None (on non-macOS)
         // On macOS it may try keychain — just ensure it doesn't panic
         let _ = get_api_key();
+    }
+}
+
+#[cfg(test)]
+mod parse_tests {
+    use super::*;
+
+    #[test]
+    fn test_parse_valid_markdown_and_json() {
+        let input = r#"## Summary
+- Point one
+- Point two
+
+## People
+| [[Alice Smith]] | Engineer |
+
+<!-- baez-entities
+{
+  "people": [{"name": "Alice Smith", "role": "Engineer", "company": "Acme", "aliases": ["Alice"], "context": "Led discussion"}],
+  "concepts": [{"name": "API Design", "description": "Building APIs first", "existing": false}],
+  "projects": []
+}
+-->"#;
+
+        let (markdown, entities) = parse_summary_output(input);
+
+        assert!(markdown.contains("## Summary"));
+        assert!(markdown.contains("## People"));
+        assert!(!markdown.contains("baez-entities"));
+        assert!(!markdown.contains("-->"));
+
+        let entities = entities.unwrap();
+        assert_eq!(entities.people.len(), 1);
+        assert_eq!(entities.people[0].name, "Alice Smith");
+        assert_eq!(entities.people[0].role.as_deref(), Some("Engineer"));
+        assert_eq!(entities.people[0].aliases, vec!["Alice"]);
+        assert_eq!(entities.concepts.len(), 1);
+        assert_eq!(entities.concepts[0].name, "API Design");
+        assert!(!entities.concepts[0].existing);
+        assert!(entities.projects.is_empty());
+    }
+
+    #[test]
+    fn test_parse_no_json_block() {
+        let input = "## Summary\n- Just markdown\n\n## Notes\nSome notes.";
+        let (markdown, entities) = parse_summary_output(input);
+        assert_eq!(markdown, input);
+        assert!(entities.is_none());
+    }
+
+    #[test]
+    fn test_parse_malformed_json() {
+        let input = "## Summary\n\n<!-- baez-entities\n{invalid json\n-->";
+        let (markdown, entities) = parse_summary_output(input);
+        assert!(markdown.contains("## Summary"));
+        assert!(entities.is_none());
+    }
+
+    #[test]
+    fn test_parse_empty_entities() {
+        let input = r#"## Summary
+
+<!-- baez-entities
+{"people": [], "concepts": [], "projects": []}
+-->"#;
+        let (markdown, entities) = parse_summary_output(input);
+        assert!(markdown.contains("## Summary"));
+        let entities = entities.unwrap();
+        assert!(entities.people.is_empty());
+        assert!(entities.concepts.is_empty());
+        assert!(entities.projects.is_empty());
+    }
+
+    #[test]
+    fn test_parse_strips_trailing_whitespace() {
+        let input = "## Summary\n- Point\n\n<!-- baez-entities\n{\"people\": [], \"concepts\": [], \"projects\": []}\n-->\n";
+        let (markdown, _) = parse_summary_output(input);
+        assert!(!markdown.contains("baez-entities"));
+    }
+}
+
+#[cfg(test)]
+mod context_tests {
+    use super::*;
+
+    #[test]
+    fn test_build_context_preamble_empty() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let result = build_context_preamble(temp.path());
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_build_context_preamble_with_concepts_and_projects() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let concepts_dir = temp.path().join("Concepts");
+        let projects_dir = temp.path().join("Projects");
+        std::fs::create_dir_all(&concepts_dir).unwrap();
+        std::fs::create_dir_all(&projects_dir).unwrap();
+
+        std::fs::write(concepts_dir.join("API Design.md"), "# API Design").unwrap();
+        std::fs::write(concepts_dir.join("Conway's Law.md"), "# Conway's Law").unwrap();
+        std::fs::write(projects_dir.join("Project Atlas.md"), "# Project Atlas").unwrap();
+
+        let result = build_context_preamble(temp.path());
+        assert!(result.contains("Existing concepts"));
+        assert!(result.contains("- API Design"));
+        assert!(result.contains("- Conway's Law"));
+        assert!(result.contains("Existing projects"));
+        assert!(result.contains("- Project Atlas"));
+    }
+
+    #[test]
+    fn test_build_context_preamble_ignores_non_md_files() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let concepts_dir = temp.path().join("Concepts");
+        std::fs::create_dir_all(&concepts_dir).unwrap();
+
+        std::fs::write(concepts_dir.join("Real Concept.md"), "").unwrap();
+        std::fs::write(concepts_dir.join(".DS_Store"), "").unwrap();
+        std::fs::write(concepts_dir.join("notes.txt"), "").unwrap();
+
+        let result = build_context_preamble(temp.path());
+        assert!(result.contains("- Real Concept"));
+        assert!(!result.contains(".DS_Store"));
+        assert!(!result.contains("notes"));
     }
 }

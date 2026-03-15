@@ -461,6 +461,12 @@ pub struct Frontmatter {
     pub duration_minutes: Option<u64>,
     #[serde(default, alias = "labels")]
     pub tags: Vec<String>,
+    /// Wiki-linked entity references for Obsidian graph connectivity
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub related: Vec<String>,
+    /// Transcript quality: "substantive" or "stub"
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
     pub generator: String,
 }
 
@@ -488,6 +494,8 @@ mod frontmatter_tests {
             attendees: vec!["Alice".into(), "Bob".into()],
             duration_minutes: Some(60),
             tags: vec!["planning".into()],
+            related: vec![],
+            status: None,
             generator: "baez".into(),
         };
 
@@ -518,6 +526,68 @@ generator: muesli 1.0
         assert_eq!(parsed.attendees, vec!["Alice"]);
         assert_eq!(parsed.duration_minutes, Some(3600)); // Note: old files store seconds here
         assert_eq!(parsed.tags, vec!["Planning"]);
+    }
+
+    #[test]
+    fn test_frontmatter_with_related_and_status() {
+        let fm = Frontmatter {
+            doc_id: "doc123".into(),
+            source: "granola".into(),
+            date: Some("2025-10-28".into()),
+            created: "2025-10-28T15:04:05Z".parse().unwrap(),
+            updated: None,
+            title: Some("Test".into()),
+            attendees: vec![],
+            duration_minutes: None,
+            tags: vec![],
+            generator: "baez".into(),
+            related: vec!["[[Alice Smith]]".into(), "[[API Design]]".into()],
+            status: Some("substantive".into()),
+        };
+
+        let yaml = serde_yaml::to_string(&fm).unwrap();
+        assert!(yaml.contains("related:"));
+        assert!(yaml.contains("[[Alice Smith]]"));
+        assert!(yaml.contains("status: substantive"));
+
+        let parsed: Frontmatter = serde_yaml::from_str(&yaml).unwrap();
+        assert_eq!(parsed.related.len(), 2);
+        assert_eq!(parsed.status.as_deref(), Some("substantive"));
+    }
+
+    #[test]
+    fn test_frontmatter_empty_related_not_serialized() {
+        let fm = Frontmatter {
+            doc_id: "doc123".into(),
+            source: "granola".into(),
+            date: None,
+            created: "2025-10-28T15:04:05Z".parse().unwrap(),
+            updated: None,
+            title: None,
+            attendees: vec![],
+            duration_minutes: None,
+            tags: vec![],
+            generator: "baez".into(),
+            related: vec![],
+            status: None,
+        };
+
+        let yaml = serde_yaml::to_string(&fm).unwrap();
+        assert!(!yaml.contains("related:"));
+        assert!(!yaml.contains("status:"));
+    }
+
+    #[test]
+    fn test_frontmatter_backward_compat_no_related_status() {
+        let yaml = r#"
+doc_id: doc123
+source: granola
+created: 2025-10-28T15:04:05Z
+generator: baez
+"#;
+        let parsed: Frontmatter = serde_yaml::from_str(yaml).unwrap();
+        assert!(parsed.related.is_empty());
+        assert!(parsed.status.is_none());
     }
 
     #[test]

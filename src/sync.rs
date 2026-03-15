@@ -6,7 +6,7 @@ use crate::{
     api::ApiClient,
     convert::to_markdown,
     storage::{read_frontmatter, set_file_time, write_atomic, Paths},
-    util::slugify,
+    util::{count_transcript_words, slugify},
     Result,
 };
 use chrono::{DateTime, Utc};
@@ -86,6 +86,33 @@ pub fn sync_all(
         None
     };
 
+    // Create entity directories only when summarization is enabled AND an API key is available
+    #[cfg(feature = "summaries")]
+    let entity_dirs_ready = summarize_state.is_some();
+    #[cfg(feature = "summaries")]
+    if entity_dirs_ready {
+        let _ = std::fs::create_dir_all(paths.vault_dir.join("People"));
+        let _ = std::fs::create_dir_all(paths.vault_dir.join("Concepts"));
+        let _ = std::fs::create_dir_all(paths.vault_dir.join("Projects"));
+    }
+    #[cfg(not(feature = "summaries"))]
+    let _entity_dirs_ready = false;
+
+    // Build PeopleIndex and context preamble once
+    #[cfg(feature = "summaries")]
+    let mut people_index = if entity_dirs_ready {
+        crate::storage::PeopleIndex::build(&paths.vault_dir.join("People"))
+    } else {
+        crate::storage::PeopleIndex::build(&std::path::PathBuf::new())
+    };
+
+    #[cfg(feature = "summaries")]
+    let mut context_preamble = if entity_dirs_ready {
+        crate::summary::build_context_preamble(&paths.vault_dir)
+    } else {
+        String::new()
+    };
+
     if dry_run {
         println!("Dry run — no files will be written");
     }
@@ -119,6 +146,12 @@ pub fn sync_all(
     let mut skipped = 0;
     #[cfg(feature = "summaries")]
     let mut summarized = 0u32;
+    #[cfg(feature = "summaries")]
+    let mut people_count = 0u32;
+    #[cfg(feature = "summaries")]
+    let mut concepts_count = 0u32;
+    #[cfg(feature = "summaries")]
+    let mut projects_count = 0u32;
 
     for doc_summary in &docs {
         // Check cache for quick timestamp comparison (--force bypasses cache)
@@ -152,6 +185,14 @@ pub fn sync_all(
         let mut meta = meta_resp.parsed;
         let transcript = transcript_resp.parsed;
 
+        // Triage: check if transcript has enough content
+        let word_count = count_transcript_words(&transcript);
+        let status = if word_count < 20 {
+            "stub"
+        } else {
+            "substantive"
+        };
+
         // The metadata endpoint sometimes omits created_at; prefer the
         // summary's value which the list endpoint always provides.
         meta.created_at = doc_summary.created_at;
@@ -163,27 +204,64 @@ pub fn sync_all(
             .map(crate::convert::prosemirror_to_markdown)
             .filter(|s| !s.is_empty());
 
-        // AI summarization via Claude API
+        // AI summarization + entity extraction (only for substantive transcripts)
         #[cfg(feature = "summaries")]
-        let summary_text: Option<String> =
+        let (summary_text, extracted_entities): (
+            Option<String>,
+            Option<crate::summary::ExtractedEntities>,
+        ) = if status == "substantive" {
             if let Some((ref config, ref key, ref claude_client)) = summarize_state {
                 let input = crate::summary::format_transcript_for_llm(&transcript, &meta);
-                match crate::summary::summarize_transcript(&input, key, config, claude_client) {
-                    Ok(s) => {
+                match crate::summary::summarize_transcript(
+                    &input,
+                    key,
+                    config,
+                    claude_client,
+                    &context_preamble,
+                ) {
+                    Ok(raw_summary) => {
                         summarized += 1;
-                        Some(s)
+                        let (clean_md, entities) =
+                            crate::summary::parse_summary_output(&raw_summary);
+                        (Some(clean_md), entities)
                     }
                     Err(e) => {
                         eprintln!("Warning: Failed to summarize {}: {}", doc_summary.id, e);
-                        None
+                        (None, None)
                     }
                 }
             } else {
-                None
-            };
+                (None, None)
+            }
+        } else {
+            (None, None)
+        };
 
         #[cfg(not(feature = "summaries"))]
         let summary_text: Option<String> = None;
+        #[cfg(not(feature = "summaries"))]
+        let _extracted_entities: Option<()> = None;
+
+        // Build related list from extracted entities
+        #[cfg(feature = "summaries")]
+        let related: Vec<String> = match &extracted_entities {
+            Some(entities) => {
+                let mut r = Vec::new();
+                for p in &entities.people {
+                    r.push(format!("[[{}]]", p.name));
+                }
+                for c in &entities.concepts {
+                    r.push(format!("[[{}]]", c.name));
+                }
+                for p in &entities.projects {
+                    r.push(format!("[[{}]]", p.name));
+                }
+                r
+            }
+            None => vec![],
+        };
+        #[cfg(not(feature = "summaries"))]
+        let related: Vec<String> = vec![];
 
         // Convert to markdown
         let md = to_markdown(
@@ -192,6 +270,8 @@ pub fn sync_all(
             &doc_summary.id,
             notes_md.as_deref(),
             summary_text.as_deref(),
+            related,
+            Some(status),
         )?;
 
         let full_md = format!("---\n{}---\n\n{}", md.frontmatter_yaml, md.body);
@@ -253,6 +333,118 @@ pub fn sync_all(
         set_file_time(&metadata_json_path, &meta.created_at)?;
         set_file_time(&doc_path, &meta.created_at)?;
 
+        // Entity reconciliation: create/update People, Concepts, Projects notes
+        #[cfg(feature = "summaries")]
+        if let Some(ref entities) = extracted_entities {
+            if entity_dirs_ready && !dry_run {
+                let date = meta.created_at.format("%Y-%m-%d").to_string();
+                let meeting_slug = format!("{}_{}", date, slug);
+
+                // Extract attendee names for disambiguation
+                let attendee_names: Vec<String> = if let Some(ref rich) = meta.attendees {
+                    rich.iter().filter_map(|a| a.name.clone()).collect()
+                } else {
+                    meta.participants.clone()
+                };
+
+                // People
+                for person in &entities.people {
+                    let match_result = people_index.find_match(&person.name, &attendee_names);
+                    if let Some((canonical, existing_path)) = match_result {
+                        let alias_refs: Vec<&str> =
+                            person.aliases.iter().map(|s| s.as_str()).collect();
+                        if let Err(e) = crate::storage::enrich_person_note(
+                            &existing_path,
+                            &alias_refs,
+                            &person.context,
+                            &meeting_slug,
+                            &date,
+                            &paths.tmp_dir,
+                        ) {
+                            eprintln!("Warning: Failed to enrich People/{}: {}", canonical, e);
+                        }
+                    } else if person.name.contains(' ') {
+                        let people_dir = paths.vault_dir.join("People");
+                        let alias_refs: Vec<&str> =
+                            person.aliases.iter().map(|s| s.as_str()).collect();
+                        if let Err(e) = crate::storage::create_person_note(
+                            &people_dir,
+                            &person.name,
+                            person.role.as_deref(),
+                            person.company.as_deref(),
+                            &alias_refs,
+                            &person.context,
+                            &meeting_slug,
+                            &date,
+                            &paths.tmp_dir,
+                        ) {
+                            eprintln!("Warning: Failed to create People/{}: {}", person.name, e);
+                        } else {
+                            people_index.add_person(&person.name, &people_dir, &alias_refs);
+                        }
+                    }
+                    people_count += 1;
+                }
+
+                // Concepts
+                let concepts_dir = paths.vault_dir.join("Concepts");
+                for concept in &entities.concepts {
+                    let existing = crate::storage::find_entity_file(&concepts_dir, &concept.name);
+                    if let Some(existing_path) = existing {
+                        if let Err(e) = crate::storage::enrich_concept_note(
+                            &existing_path,
+                            &meeting_slug,
+                            &date,
+                            &paths.tmp_dir,
+                        ) {
+                            eprintln!("Warning: Failed to enrich Concepts/{}: {}", concept.name, e);
+                        }
+                    } else if let Err(e) = crate::storage::create_concept_note(
+                        &concepts_dir,
+                        &concept.name,
+                        &concept.description,
+                        &meeting_slug,
+                        &date,
+                        &paths.tmp_dir,
+                    ) {
+                        eprintln!("Warning: Failed to create Concepts/{}: {}", concept.name, e);
+                    } else {
+                        // Update context preamble so subsequent meetings see this concept
+                        context_preamble = crate::summary::build_context_preamble(&paths.vault_dir);
+                    }
+                    concepts_count += 1;
+                }
+
+                // Projects
+                let projects_dir = paths.vault_dir.join("Projects");
+                for project in &entities.projects {
+                    let existing = crate::storage::find_entity_file(&projects_dir, &project.name);
+                    if let Some(existing_path) = existing {
+                        if let Err(e) = crate::storage::enrich_project_note(
+                            &existing_path,
+                            &project.description,
+                            &meeting_slug,
+                            &paths.tmp_dir,
+                        ) {
+                            eprintln!("Warning: Failed to enrich Projects/{}: {}", project.name, e);
+                        }
+                    } else if let Err(e) = crate::storage::create_project_note(
+                        &projects_dir,
+                        &project.name,
+                        &project.description,
+                        &meeting_slug,
+                        &date,
+                        &paths.tmp_dir,
+                    ) {
+                        eprintln!("Warning: Failed to create Projects/{}: {}", project.name, e);
+                    } else {
+                        context_preamble = crate::summary::build_context_preamble(&paths.vault_dir);
+                    }
+                    projects_count += 1;
+                }
+            }
+        }
+
         // Update cache - CRITICAL: store the same timestamp we compare against
         // (doc_summary.updated_at, NOT meta.updated_at - they can differ!)
         let stored_ts = doc_summary.updated_at.unwrap_or(doc_summary.created_at);
@@ -272,11 +464,14 @@ pub fn sync_all(
 
     #[cfg(feature = "summaries")]
     let stats_msg = format!(
-        "synced {} docs ({} new/updated, {} skipped, {} summarized)",
+        "synced {} docs ({} new/updated, {} skipped, {} summarized, {} people, {} concepts, {} projects)",
         docs.len(),
         synced,
         skipped,
-        summarized
+        summarized,
+        people_count,
+        concepts_count,
+        projects_count
     );
     #[cfg(not(feature = "summaries"))]
     let stats_msg = format!(
