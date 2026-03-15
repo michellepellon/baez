@@ -30,7 +30,7 @@ pub use storage::{
     read_frontmatter, write_atomic, Paths, PeopleIndex,
 };
 pub use sync::sync_all;
-pub use util::count_transcript_words;
+pub use util::{count_transcript_words, doc_slug};
 
 #[cfg(feature = "summaries")]
 pub use summary::{

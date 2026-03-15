@@ -277,7 +277,7 @@ pub fn sync_all(
         let full_md = format!("---\n{}---\n\n{}", md.frontmatter_yaml, md.body);
 
         // Compute filename and date-based path
-        let slug = slugify(meta.title.as_deref().unwrap_or("untitled"));
+        let slug = crate::util::doc_slug(meta.title.as_deref(), &doc_summary.id);
         let doc_path = paths.doc_path(&meta.created_at, &slug);
         let date = meta.created_at.format("%Y-%m-%d").to_string();
         let base_filename = format!("{}_{}", date, slug);

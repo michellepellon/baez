@@ -61,7 +61,7 @@ fn run() -> Result<()> {
             let transcript = transcript_resp.parsed;
 
             // Compute filename
-            let slug = baez::util::slugify(meta.title.as_deref().unwrap_or("untitled"));
+            let slug = baez::util::doc_slug(meta.title.as_deref(), id);
             let doc_path = paths.doc_path(&meta.created_at, &slug);
             let date = meta.created_at.format("%Y-%m-%d").to_string();
             let base_filename = format!("{}_{}", date, slug);

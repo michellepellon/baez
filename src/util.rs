@@ -18,6 +18,22 @@ pub fn slugify(text: &str) -> String {
     }
 }
 
+/// Build a unique slug for a document, appending a short ID hash for untitled meetings.
+pub fn doc_slug(title: Option<&str>, doc_id: &str) -> String {
+    let base = slugify(title.unwrap_or("untitled"));
+    if base == "untitled" {
+        // Append first 8 chars of doc_id to disambiguate
+        let short_id: String = doc_id
+            .chars()
+            .filter(|c| c.is_alphanumeric())
+            .take(8)
+            .collect();
+        format!("untitled-{}", short_id)
+    } else {
+        base
+    }
+}
+
 /// Count the total number of words across all transcript entries.
 /// Used for triage: transcripts with < 20 words are classified as stubs.
 pub fn count_transcript_words(transcript: &crate::model::RawTranscript) -> usize {
