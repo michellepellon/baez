@@ -168,7 +168,7 @@ pub fn sync_all(
         let summary_text: Option<String> =
             if let Some((ref config, ref key, ref claude_client)) = summarize_state {
                 let input = crate::summary::format_transcript_for_llm(&transcript, &meta);
-                match crate::summary::summarize_transcript(&input, key, config, claude_client) {
+                match crate::summary::summarize_transcript(&input, key, config, claude_client, "") {
                     Ok(s) => {
                         summarized += 1;
                         Some(s)

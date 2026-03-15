@@ -16,16 +16,40 @@ Given the transcript below, produce a structured summary with these sections:
 3–7 bullet points capturing the meeting's essence.
 
 ## Key Decisions
-Numbered list of decisions made (or "None").
+Bulleted list of decisions made, each wrapped in a Dataview inline field:
+- [decision:: Approve Q2 budget for infrastructure migration]
+- [decision:: Defer mobile app to Q3]
+If no decisions were made, write "None."
 
 ## Action Items
-- [ ] **[[Owner]]**: Task description *(due: date if mentioned, priority: high/medium/low)*
+Bulleted checklist. Each item uses Dataview inline fields for owner and action, with optional due date and priority:
+- [ ] [owner:: [[Alice Smith]]] [action:: Deploy staging environment by Friday] *(due: 2025-03-20, priority: high)*
+- [ ] [owner:: [[Bob Chen]]] [action:: Update API documentation] *(priority: medium)*
+Owner names must be [[wiki-links]]. Due dates and priorities are optional — only include if mentioned.
 
 ## Discussion Highlights
 Group by topic using ### subheadings. Use [[wiki-links]] for people's names.
 
 ## Open Questions
 Bulleted list of unresolved items.
+
+## People
+Table of all people mentioned with their role/context in this meeting:
+| Person | Role/Context |
+|--------|-------------|
+| [[Alice Smith]] | Engineering Manager, led API discussion |
+
+## Project Ideas
+- [[Project Name]] — what was discussed, potential next steps
+
+## Blog Ideas
+- **Idea title** — why it's worth writing about, angle to take
+
+## Concepts
+- [[Concept Name]] — brief description and why it matters
+
+## Ideas
+- Idea description — enough context to act on later
 
 Rules:
 - Use [[wiki-links]] for all person names (e.g. [[Alice Smith]]).
@@ -34,7 +58,36 @@ Rules:
 - Preserve important names, dates, and numbers accurately.
 - Only use information from the transcript; label any inferences as "(inferred)".
 - Be explicit when something is unclear, missing, or not specified.
-- Ignore small talk; focus on substance."#;
+- Ignore small talk; focus on substance.
+- Use Dataview inline field syntax [field:: value] exactly as shown in the examples above.
+- If a section has no items, write "None." under the heading — do not omit the section.
+
+After the markdown summary, output a machine-readable JSON entity block for automated processing.
+Wrap it in an HTML comment so it does not render in Obsidian:
+
+<!-- baez-entities
+{
+  "people": [
+    {"name": "Full Name", "role": "their role if known", "company": "their company if known", "aliases": ["nickname", "abbreviation"], "context": "one-line context from this meeting"}
+  ],
+  "concepts": [
+    {"name": "Concept Name", "description": "one-line description", "existing": true}
+  ],
+  "projects": [
+    {"name": "Project Name", "description": "one-line description", "existing": false}
+  ]
+}
+-->
+
+Rules for the entity block:
+- Include ALL people mentioned by name (full names only — skip first-name-only references unless you can infer the full name from context).
+- For concepts: set "existing" to true if the concept appears in the provided existing concepts list, false otherwise.
+- For projects: set "existing" to true if the project appears in the provided existing projects list, false otherwise.
+- Only include genuinely reusable concepts, not trivial topics.
+- The JSON must be valid. Use null for missing optional fields (role, company)."#;
+
+/// Simplified prompt for intermediate chunk summaries (no entity extraction).
+const CHUNK_SUMMARY_PROMPT: &str = r#"You are an expert meeting summarizer. Summarize the following transcript chunk into a concise narrative. Focus on key points, decisions, and action items. Use [[wiki-links]] for person names. This is a partial transcript — do not state conclusions about the overall meeting."#;
 
 const CLAUDE_API_URL: &str = "https://api.anthropic.com/v1/messages";
 const ANTHROPIC_VERSION: &str = "2023-06-01";
@@ -55,7 +108,7 @@ impl Default for SummaryConfig {
         Self {
             model: "claude-opus-4-6".to_string(),
             max_input_chars: 600_000, // ~150K tokens
-            max_tokens: 4096,
+            max_tokens: 8192,
             custom_prompt: None,
             temperature: None,
         }
@@ -216,21 +269,38 @@ pub fn summarize_transcript(
     api_key: &str,
     config: &SummaryConfig,
     client: &reqwest::blocking::Client,
+    context_preamble: &str,
 ) -> Result<String> {
     let chunks = chunk_transcript(transcript_text, config.max_input_chars);
 
     if chunks.len() > 1 {
+        // Multi-chunk: use simplified prompt for intermediate summaries
+        let chunk_config = SummaryConfig {
+            custom_prompt: Some(CHUNK_SUMMARY_PROMPT.to_string()),
+            ..config.clone()
+        };
         let mut chunk_summaries = Vec::new();
         for (i, chunk) in chunks.iter().enumerate() {
             println!("Summarizing chunk {}/{}...", i + 1, chunks.len());
-            let summary = call_claude_api(client, chunk, api_key, config)?;
+            let summary = call_claude_api(client, chunk, api_key, &chunk_config)?;
             chunk_summaries.push(summary);
         }
-        // Combine summaries into a single final summary
-        let combined = chunk_summaries.join("\n\n---\n\n");
+        // Final pass: combine chunk summaries with full prompt + context preamble
+        let combined = format!(
+            "{}\n\nCombined meeting summary from {} chunks:\n\n{}",
+            context_preamble,
+            chunks.len(),
+            chunk_summaries.join("\n\n---\n\n")
+        );
         call_claude_api(client, &combined, api_key, config)
     } else {
-        call_claude_api(client, &chunks[0], api_key, config)
+        // Single chunk: full prompt with context preamble
+        let input = if context_preamble.is_empty() {
+            chunks[0].clone()
+        } else {
+            format!("{}\n\n{}", context_preamble, &chunks[0])
+        };
+        call_claude_api(client, &input, api_key, config)
     }
 }
 
@@ -536,7 +606,7 @@ mod tests {
         let config = SummaryConfig::default();
         assert_eq!(config.model, "claude-opus-4-6");
         assert_eq!(config.max_input_chars, 600_000);
-        assert_eq!(config.max_tokens, 4096);
+        assert_eq!(config.max_tokens, 8192);
         assert!(config.custom_prompt.is_none());
         assert!(config.temperature.is_none());
     }

@@ -234,8 +234,9 @@ fn run() -> Result<()> {
                 "Summarizing with {} (max input: {} chars)...",
                 config.model, config.max_input_chars
             );
-            let summary =
-                baez::summary::summarize_transcript(&input, &api_key, &config, &claude_client)?;
+            let raw_summary =
+                baez::summary::summarize_transcript(&input, &api_key, &config, &claude_client, "")?;
+            let (summary, _entities) = baez::summary::parse_summary_output(&raw_summary);
 
             if save {
                 let content = std::fs::read_to_string(&md_path)?;
