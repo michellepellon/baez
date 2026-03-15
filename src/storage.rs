@@ -3,8 +3,10 @@
 //! Handles paths, directory permissions, config file access, and frontmatter parsing.
 
 use crate::{Error, Frontmatter, Result};
+use crate::util::levenshtein_distance;
 use chrono::{DateTime, Datelike, Utc};
 use filetime::FileTime;
+use std::collections::HashMap;
 use std::env;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -270,6 +272,185 @@ pub fn read_frontmatter(md_path: &Path) -> Result<Option<Frontmatter>> {
     }
 }
 
+/// In-memory index of People/ notes for fuzzy name matching.
+pub struct PeopleIndex {
+    /// Maps lowercase canonical name → (original_case_name, file_path)
+    entries: HashMap<String, (String, PathBuf)>,
+    /// Maps lowercase alias → lowercase canonical name
+    aliases: HashMap<String, String>,
+}
+
+impl PeopleIndex {
+    /// Build the index by scanning the People/ directory.
+    pub fn build(people_dir: &Path) -> Self {
+        let mut entries = HashMap::new();
+        let mut aliases = HashMap::new();
+
+        if !people_dir.is_dir() {
+            return PeopleIndex { entries, aliases };
+        }
+
+        let dir_entries = match fs::read_dir(people_dir) {
+            Ok(e) => e,
+            Err(_) => return PeopleIndex { entries, aliases },
+        };
+
+        for entry in dir_entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|s| s.to_str()) != Some("md") {
+                continue;
+            }
+
+            let canonical = match path.file_stem().and_then(|s| s.to_str()) {
+                Some(name) => name.to_string(),
+                None => continue,
+            };
+
+            let canonical_lower = canonical.to_lowercase();
+
+            // Try to read aliases from frontmatter
+            if let Ok(content) = fs::read_to_string(&path) {
+                if let Some(alias_list) = parse_aliases_from_frontmatter(&content) {
+                    for alias in alias_list {
+                        aliases.insert(alias.to_lowercase(), canonical_lower.clone());
+                    }
+                }
+            }
+
+            entries.insert(canonical_lower, (canonical, path));
+        }
+
+        PeopleIndex { entries, aliases }
+    }
+
+    /// Register a newly created person in the index (no filesystem I/O).
+    pub fn add_person(&mut self, name: &str, people_dir: &Path, new_aliases: &[&str]) {
+        let lower = name.to_lowercase();
+        let path = people_dir.join(format!("{}.md", name));
+        self.entries.insert(lower.clone(), (name.to_string(), path));
+        for alias in new_aliases {
+            self.aliases.insert(alias.to_lowercase(), lower.clone());
+        }
+    }
+
+    /// Find a matching person for the given name.
+    ///
+    /// Returns `Some((canonical_name, file_path))` on match, `None` on no match or ambiguity.
+    pub fn find_match(&self, name: &str, attendees: &[String]) -> Option<(String, PathBuf)> {
+        let lower = name.to_lowercase();
+
+        // 1. Exact match
+        if let Some((canonical, path)) = self.entries.get(&lower) {
+            return Some((canonical.clone(), path.clone()));
+        }
+
+        // 2. Alias match
+        if let Some(canonical_lower) = self.aliases.get(&lower) {
+            if let Some((canonical, path)) = self.entries.get(canonical_lower) {
+                return Some((canonical.clone(), path.clone()));
+            }
+        }
+
+        // 3. Attendee disambiguation (first-name-only)
+        if !name.contains(' ') {
+            let matches: Vec<&String> = attendees
+                .iter()
+                .filter(|a| a.to_lowercase().starts_with(&lower))
+                .collect();
+
+            if matches.len() == 1 {
+                let full_name_lower = matches[0].to_lowercase();
+                // Re-try exact and alias match with the full name
+                if let Some((canonical, path)) = self.entries.get(&full_name_lower) {
+                    return Some((canonical.clone(), path.clone()));
+                }
+                if let Some(canonical_lower) = self.aliases.get(&full_name_lower) {
+                    if let Some((canonical, path)) = self.entries.get(canonical_lower) {
+                        return Some((canonical.clone(), path.clone()));
+                    }
+                }
+            }
+        }
+
+        // 4. Fuzzy match (Levenshtein)
+        if lower.len() <= 5 {
+            // Short names require exact match (too many false positives)
+            return None;
+        }
+
+        let threshold = 2;
+        let mut best_match: Option<(String, PathBuf, usize)> = None;
+        let mut ambiguous = false;
+
+        // Check against entry names
+        for (entry_lower, (canonical, path)) in &self.entries {
+            let dist = levenshtein_distance(&lower, entry_lower);
+            if dist <= threshold {
+                match &best_match {
+                    Some((_, _, best_dist)) if dist < *best_dist => {
+                        best_match = Some((canonical.clone(), path.clone(), dist));
+                        ambiguous = false;
+                    }
+                    Some((_, _, best_dist)) if dist == *best_dist => {
+                        ambiguous = true;
+                    }
+                    None => {
+                        best_match = Some((canonical.clone(), path.clone(), dist));
+                    }
+                    _ => {}
+                }
+            }
+        }
+
+        // Check against aliases
+        for (alias_lower, canonical_lower) in &self.aliases {
+            let dist = levenshtein_distance(&lower, alias_lower);
+            if dist <= threshold {
+                if let Some((canonical, path)) = self.entries.get(canonical_lower) {
+                    match &best_match {
+                        Some((_, _, best_dist)) if dist < *best_dist => {
+                            best_match = Some((canonical.clone(), path.clone(), dist));
+                            ambiguous = false;
+                        }
+                        Some((_, _, best_dist)) if dist == *best_dist => {
+                            ambiguous = true;
+                        }
+                        None => {
+                            best_match = Some((canonical.clone(), path.clone(), dist));
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+
+        if ambiguous {
+            return None;
+        }
+
+        best_match.map(|(name, path, _)| (name, path))
+    }
+}
+
+/// Extract the `aliases` array from YAML frontmatter in a markdown file.
+fn parse_aliases_from_frontmatter(content: &str) -> Option<Vec<String>> {
+    if !content.starts_with("---\n") {
+        return None;
+    }
+    let rest = &content[4..];
+    let end_pos = rest.find("\n---")?;
+    let yaml = &rest[..end_pos];
+
+    let value: serde_json::Value = serde_yaml::from_str(yaml).ok()?;
+    let aliases = value.get("aliases")?.as_array()?;
+    Some(
+        aliases
+            .iter()
+            .filter_map(|v| v.as_str().map(|s| s.to_string()))
+            .collect(),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -447,5 +628,156 @@ generator: "muesli 1.0"
         assert_eq!(fm.doc_id, "doc123");
         assert_eq!(fm.attendees, vec!["Alice"]);
         assert_eq!(fm.tags, vec!["planning"]);
+    }
+}
+
+#[cfg(test)]
+mod people_index_tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    fn write_person(dir: &Path, name: &str, aliases: &[&str]) {
+        let alias_yaml = if aliases.is_empty() {
+            "aliases: []".to_string()
+        } else {
+            format!("aliases: [{}]", aliases.iter().map(|a| format!("\"{}\"", a)).collect::<Vec<_>>().join(", "))
+        };
+        let content = format!(
+            "---\ntitle: \"{}\"\n{}\ntype: person\n---\n\n# {}\n",
+            name, alias_yaml, name
+        );
+        fs::write(dir.join(format!("{}.md", name)), content).unwrap();
+    }
+
+    #[test]
+    fn test_build_empty_dir() {
+        let temp = TempDir::new().unwrap();
+        let people_dir = temp.path().join("People");
+        fs::create_dir_all(&people_dir).unwrap();
+        let index = PeopleIndex::build(&people_dir);
+        assert!(index.find_match("Alice", &[]).is_none());
+    }
+
+    #[test]
+    fn test_exact_match() {
+        let temp = TempDir::new().unwrap();
+        let people_dir = temp.path().join("People");
+        fs::create_dir_all(&people_dir).unwrap();
+        write_person(&people_dir, "Alice Smith", &[]);
+        let index = PeopleIndex::build(&people_dir);
+        let result = index.find_match("Alice Smith", &[]);
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().0, "Alice Smith");
+    }
+
+    #[test]
+    fn test_case_insensitive_match() {
+        let temp = TempDir::new().unwrap();
+        let people_dir = temp.path().join("People");
+        fs::create_dir_all(&people_dir).unwrap();
+        write_person(&people_dir, "Alice Smith", &[]);
+        let index = PeopleIndex::build(&people_dir);
+        let result = index.find_match("alice smith", &[]);
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().0, "Alice Smith");
+    }
+
+    #[test]
+    fn test_alias_match() {
+        let temp = TempDir::new().unwrap();
+        let people_dir = temp.path().join("People");
+        fs::create_dir_all(&people_dir).unwrap();
+        write_person(&people_dir, "Dennis Crowley", &["Dens", "DC"]);
+        let index = PeopleIndex::build(&people_dir);
+        let result = index.find_match("Dens", &[]);
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().0, "Dennis Crowley");
+    }
+
+    #[test]
+    fn test_attendee_disambiguation() {
+        let temp = TempDir::new().unwrap();
+        let people_dir = temp.path().join("People");
+        fs::create_dir_all(&people_dir).unwrap();
+        write_person(&people_dir, "Alice Smith", &[]);
+        let index = PeopleIndex::build(&people_dir);
+        let attendees = vec!["Alice Smith".to_string(), "Bob Jones".to_string()];
+        let result = index.find_match("Alice", &attendees);
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().0, "Alice Smith");
+    }
+
+    #[test]
+    fn test_attendee_disambiguation_ambiguous() {
+        let temp = TempDir::new().unwrap();
+        let people_dir = temp.path().join("People");
+        fs::create_dir_all(&people_dir).unwrap();
+        write_person(&people_dir, "Alice Smith", &[]);
+        write_person(&people_dir, "Alice Jones", &[]);
+        let index = PeopleIndex::build(&people_dir);
+        let attendees = vec!["Alice Smith".to_string(), "Alice Jones".to_string()];
+        let result = index.find_match("Alice", &attendees);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_fuzzy_match_within_threshold() {
+        let temp = TempDir::new().unwrap();
+        let people_dir = temp.path().join("People");
+        fs::create_dir_all(&people_dir).unwrap();
+        write_person(&people_dir, "Alice Smith", &[]);
+        let index = PeopleIndex::build(&people_dir);
+        let result = index.find_match("Alce Smith", &[]);
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().0, "Alice Smith");
+    }
+
+    #[test]
+    fn test_fuzzy_match_beyond_threshold() {
+        let temp = TempDir::new().unwrap();
+        let people_dir = temp.path().join("People");
+        fs::create_dir_all(&people_dir).unwrap();
+        write_person(&people_dir, "Alice Smith", &[]);
+        let index = PeopleIndex::build(&people_dir);
+        let result = index.find_match("Bob Johnson", &[]);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_short_name_requires_exact() {
+        let temp = TempDir::new().unwrap();
+        let people_dir = temp.path().join("People");
+        fs::create_dir_all(&people_dir).unwrap();
+        write_person(&people_dir, "Bob", &[]);
+        let index = PeopleIndex::build(&people_dir);
+        let result = index.find_match("Rob", &[]);
+        assert!(result.is_none());
+        let result = index.find_match("Bob", &[]);
+        assert!(result.is_some());
+    }
+
+    #[test]
+    fn test_no_match_returns_none() {
+        let temp = TempDir::new().unwrap();
+        let people_dir = temp.path().join("People");
+        fs::create_dir_all(&people_dir).unwrap();
+        write_person(&people_dir, "Alice Smith", &[]);
+        let index = PeopleIndex::build(&people_dir);
+        let result = index.find_match("Totally Different Person", &[]);
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_add_person_updates_index() {
+        let temp = TempDir::new().unwrap();
+        let people_dir = temp.path().join("People");
+        fs::create_dir_all(&people_dir).unwrap();
+        let mut index = PeopleIndex::build(&people_dir);
+        assert!(index.find_match("New Person", &[]).is_none());
+        index.add_person("New Person", &people_dir, &["NP"]);
+        let result = index.find_match("New Person", &[]);
+        assert!(result.is_some());
+        let result = index.find_match("NP", &[]);
+        assert!(result.is_some());
     }
 }
