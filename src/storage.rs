@@ -432,6 +432,221 @@ impl PeopleIndex {
     }
 }
 
+/// Read entity note frontmatter as flexible JSON Value + body text.
+/// Returns None if file doesn't exist or has no frontmatter.
+pub fn read_entity_frontmatter(path: &Path) -> Result<Option<(serde_json::Value, String)>> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    let content = fs::read_to_string(path)?;
+    if !content.starts_with("---\n") {
+        return Ok(None);
+    }
+    let rest = &content[4..];
+    let Some(end_pos) = rest.find("\n---") else {
+        return Ok(None);
+    };
+    let yaml = &rest[..end_pos];
+    let body_start = end_pos + 4;
+    let body = if body_start < rest.len() {
+        let skip = if rest.as_bytes().get(body_start) == Some(&b'\n') { 1 } else { 0 };
+        rest[body_start + skip..].to_string()
+    } else {
+        String::new()
+    };
+    let value: serde_json::Value = serde_yaml::from_str(yaml).map_err(|e| {
+        Error::Filesystem(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("Failed to parse entity frontmatter: {}", e),
+        ))
+    })?;
+    Ok(Some((value, body)))
+}
+
+/// Find an entity file by name, case-insensitive.
+pub fn find_entity_file(dir: &Path, name: &str) -> Option<PathBuf> {
+    let lower = name.to_lowercase();
+    fs::read_dir(dir).ok()?.flatten().find_map(|entry| {
+        let path = entry.path();
+        if path.extension().and_then(|s| s.to_str()) == Some("md") {
+            let stem = path.file_stem()?.to_str()?;
+            if stem.to_lowercase() == lower {
+                return Some(path);
+            }
+        }
+        None
+    })
+}
+
+/// Create a new People note.
+#[allow(clippy::too_many_arguments)]
+pub fn create_person_note(
+    people_dir: &Path, name: &str, role: Option<&str>, company: Option<&str>,
+    aliases: &[&str], context: &str, meeting_slug: &str, date: &str, tmp_dir: &Path,
+) -> Result<()> {
+    let alias_yaml = if aliases.is_empty() {
+        "[]".to_string()
+    } else {
+        format!("[{}]", aliases.iter().map(|a| format!("\"{}\"", a)).collect::<Vec<_>>().join(", "))
+    };
+    let company_str = company.unwrap_or("Unknown");
+    let role_str = role.unwrap_or("Unknown");
+    let mut ctx_lines = String::new();
+    if company.is_some() {
+        ctx_lines.push_str(&format!("- **Company:** {}\n", company_str));
+    }
+    if role.is_some() {
+        ctx_lines.push_str(&format!("- **Role:** {}\n", role_str));
+    }
+    let mut fm_extra = String::new();
+    if company.is_some() {
+        fm_extra.push_str(&format!("company: \"{}\"\n", company_str));
+    }
+    if role.is_some() {
+        fm_extra.push_str(&format!("role: \"{}\"\n", role_str));
+    }
+    let content = format!(
+        "---\ntitle: \"{name}\"\ndate: \"{date}\"\ntags: [people]\naliases: {alias_yaml}\ntype: person\n{fm_extra}last-contact: \"{date}\"\nstatus: active\nrelated:\n  - \"[[{meeting_slug}]]\"\n---\n\n# {name}\n\n## Context\n{ctx_lines}\n## Notes\n- From [[{meeting_slug}]]: {context}\n",
+        name=name, date=date, alias_yaml=alias_yaml, fm_extra=fm_extra,
+        meeting_slug=meeting_slug, context=context, ctx_lines=ctx_lines,
+    );
+    let path = people_dir.join(format!("{}.md", name));
+    write_atomic(&path, content.as_bytes(), tmp_dir)
+}
+
+/// Enrich an existing People note with a new meeting reference.
+pub fn enrich_person_note(
+    path: &Path, new_aliases: &[&str], context: &str,
+    meeting_slug: &str, date: &str, tmp_dir: &Path,
+) -> Result<()> {
+    let Some((mut fm, body)) = read_entity_frontmatter(path)? else {
+        return Ok(());
+    };
+    // Update related (no duplicates)
+    let meeting_ref = format!("[[{}]]", meeting_slug);
+    if let Some(related) = fm.get_mut("related").and_then(|v| v.as_array_mut()) {
+        if !related.iter().any(|v| v.as_str() == Some(&meeting_ref)) {
+            related.push(serde_json::Value::String(meeting_ref));
+        }
+    } else {
+        fm["related"] = serde_json::json!([meeting_ref]);
+    }
+    // Update last-contact if newer
+    if let Some(existing_date) = fm.get("last-contact").and_then(|v| v.as_str()) {
+        if date > existing_date { fm["last-contact"] = serde_json::Value::String(date.to_string()); }
+    } else {
+        fm["last-contact"] = serde_json::Value::String(date.to_string());
+    }
+    // Merge aliases
+    if !new_aliases.is_empty() {
+        let existing: Vec<String> = fm.get("aliases").and_then(|v| v.as_array())
+            .map(|arr| arr.iter().filter_map(|v| v.as_str().map(|s| s.to_string())).collect())
+            .unwrap_or_default();
+        let mut merged = existing;
+        for alias in new_aliases {
+            if !merged.iter().any(|a| a.to_lowercase() == alias.to_lowercase()) {
+                merged.push(alias.to_string());
+            }
+        }
+        fm["aliases"] = serde_json::json!(merged);
+    }
+    let fm_yaml = serde_yaml::to_string(&fm).map_err(|e| {
+        Error::Filesystem(std::io::Error::new(std::io::ErrorKind::InvalidData, format!("Failed to serialize: {}", e)))
+    })?;
+    // Append to ## Notes section (or create it)
+    let notes_bullet = format!("- From [[{}]]: {}", meeting_slug, context);
+    let updated_body = if body.contains("## Notes") {
+        let pos = body.find("## Notes").unwrap();
+        let after = &body[pos + 8..];
+        let next = after.find("\n## ");
+        let insert_pos = match next { Some(p) => pos + 8 + p, None => body.len() };
+        let mut new_body = body[..insert_pos].to_string();
+        if !new_body.ends_with('\n') { new_body.push('\n'); }
+        new_body.push_str(&notes_bullet);
+        new_body.push('\n');
+        new_body.push_str(&body[insert_pos..]);
+        new_body
+    } else {
+        format!("{}\n## Notes\n{}\n", body.trim_end(), notes_bullet)
+    };
+    let full = format!("---\n{}---\n{}", fm_yaml, updated_body);
+    write_atomic(path, full.as_bytes(), tmp_dir)
+}
+
+/// Create a new Concept note.
+pub fn create_concept_note(
+    concepts_dir: &Path, name: &str, description: &str,
+    meeting_slug: &str, date: &str, tmp_dir: &Path,
+) -> Result<()> {
+    let content = format!(
+        "---\ntitle: \"{name}\"\ndate: \"{date}\"\ntags: [concept]\ntype: concept\nstatus: active\nrelated:\n  - \"[[{meeting_slug}]]\"\n---\n\n# {name}\n\n## What is it?\n{description}\n\n## Sources\n- [[{meeting_slug}]] — extracted {date}\n",
+        name=name, date=date, description=description, meeting_slug=meeting_slug,
+    );
+    let path = concepts_dir.join(format!("{}.md", name));
+    write_atomic(&path, content.as_bytes(), tmp_dir)
+}
+
+/// Enrich an existing Concept note with a new source reference.
+pub fn enrich_concept_note(path: &Path, meeting_slug: &str, date: &str, tmp_dir: &Path) -> Result<()> {
+    let Some((mut fm, body)) = read_entity_frontmatter(path)? else { return Ok(()); };
+    let meeting_ref = format!("[[{}]]", meeting_slug);
+    if let Some(related) = fm.get_mut("related").and_then(|v| v.as_array_mut()) {
+        if !related.iter().any(|v| v.as_str() == Some(&meeting_ref)) {
+            related.push(serde_json::Value::String(meeting_ref));
+        }
+    } else { fm["related"] = serde_json::json!([meeting_ref]); }
+    let fm_yaml = serde_yaml::to_string(&fm).map_err(|e| {
+        Error::Filesystem(std::io::Error::new(std::io::ErrorKind::InvalidData, format!("Failed to serialize: {}", e)))
+    })?;
+    let source_line = format!("- [[{}]] — extracted {}", meeting_slug, date);
+    let updated_body = if body.contains("## Sources") {
+        let pos = body.find("## Sources").unwrap();
+        let after = &body[pos + 10..];
+        let next = after.find("\n## ");
+        let insert_pos = match next { Some(p) => pos + 10 + p, None => body.len() };
+        let mut new_body = body[..insert_pos].to_string();
+        if !new_body.ends_with('\n') { new_body.push('\n'); }
+        new_body.push_str(&source_line); new_body.push('\n');
+        new_body.push_str(&body[insert_pos..]);
+        new_body
+    } else {
+        format!("{}\n## Sources\n{}\n", body.trim_end(), source_line)
+    };
+    let full = format!("---\n{}---\n{}", fm_yaml, updated_body);
+    write_atomic(path, full.as_bytes(), tmp_dir)
+}
+
+/// Create a new Project note.
+pub fn create_project_note(
+    projects_dir: &Path, name: &str, description: &str,
+    meeting_slug: &str, date: &str, tmp_dir: &Path,
+) -> Result<()> {
+    let content = format!(
+        "---\ntitle: \"{name}\"\ndate: \"{date}\"\ntags: [project]\ntype: project\nstatus: active\nrelated:\n  - \"[[{meeting_slug}]]\"\n---\n\n# {name}\n\nMentioned in [[{meeting_slug}]]: {description}\n",
+        name=name, date=date, description=description, meeting_slug=meeting_slug,
+    );
+    let path = projects_dir.join(format!("{}.md", name));
+    write_atomic(&path, content.as_bytes(), tmp_dir)
+}
+
+/// Enrich an existing Project note with a new mention.
+pub fn enrich_project_note(path: &Path, description: &str, meeting_slug: &str, tmp_dir: &Path) -> Result<()> {
+    let Some((mut fm, body)) = read_entity_frontmatter(path)? else { return Ok(()); };
+    let meeting_ref = format!("[[{}]]", meeting_slug);
+    if let Some(related) = fm.get_mut("related").and_then(|v| v.as_array_mut()) {
+        if !related.iter().any(|v| v.as_str() == Some(&meeting_ref)) {
+            related.push(serde_json::Value::String(meeting_ref));
+        }
+    } else { fm["related"] = serde_json::json!([meeting_ref]); }
+    let fm_yaml = serde_yaml::to_string(&fm).map_err(|e| {
+        Error::Filesystem(std::io::Error::new(std::io::ErrorKind::InvalidData, format!("Failed to serialize: {}", e)))
+    })?;
+    let mention_line = format!("\nMentioned in [[{}]]: {}", meeting_slug, description);
+    let updated_body = format!("{}{}\n", body.trim_end(), mention_line);
+    let full = format!("---\n{}---\n{}", fm_yaml, updated_body);
+    write_atomic(path, full.as_bytes(), tmp_dir)
+}
+
 /// Extract the `aliases` array from YAML frontmatter in a markdown file.
 fn parse_aliases_from_frontmatter(content: &str) -> Option<Vec<String>> {
     if !content.starts_with("---\n") {
@@ -779,5 +994,153 @@ mod people_index_tests {
         assert!(result.is_some());
         let result = index.find_match("NP", &[]);
         assert!(result.is_some());
+    }
+}
+
+#[cfg(test)]
+mod entity_note_tests {
+    use super::*;
+    use tempfile::TempDir;
+
+    #[test]
+    fn test_read_entity_frontmatter_valid() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("test.md");
+        fs::write(&path, "---\ntitle: \"Test\"\ntype: person\nrelated: []\n---\n\n# Test\n\nBody content.\n").unwrap();
+        let result = read_entity_frontmatter(&path).unwrap();
+        assert!(result.is_some());
+        let (fm, body) = result.unwrap();
+        assert_eq!(fm["title"].as_str(), Some("Test"));
+        assert!(body.contains("Body content."));
+    }
+
+    #[test]
+    fn test_read_entity_frontmatter_missing() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("missing.md");
+        let result = read_entity_frontmatter(&path).unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_read_entity_frontmatter_no_yaml() {
+        let temp = TempDir::new().unwrap();
+        let path = temp.path().join("plain.md");
+        fs::write(&path, "# Just content\n").unwrap();
+        let result = read_entity_frontmatter(&path).unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_create_person_note() {
+        let temp = TempDir::new().unwrap();
+        let people_dir = temp.path().join("People");
+        fs::create_dir_all(&people_dir).unwrap();
+        let tmp_dir = temp.path().join("tmp");
+        fs::create_dir_all(&tmp_dir).unwrap();
+        create_person_note(&people_dir, "Alice Smith", Some("Engineer"), Some("Acme Corp"), &["Alice"], "Led API discussion", "2025-01-15_standup", "2025-01-15", &tmp_dir).unwrap();
+        let path = people_dir.join("Alice Smith.md");
+        assert!(path.exists());
+        let content = fs::read_to_string(&path).unwrap();
+        assert!(content.contains("title: \"Alice Smith\""));
+        assert!(content.contains("company: \"Acme Corp\""));
+        assert!(content.contains("role: \"Engineer\""));
+        assert!(content.contains("[[2025-01-15_standup]]"));
+        assert!(content.contains("Led API discussion"));
+    }
+
+    #[test]
+    fn test_enrich_person_note_adds_related() {
+        let temp = TempDir::new().unwrap();
+        let tmp_dir = temp.path().join("tmp");
+        fs::create_dir_all(&tmp_dir).unwrap();
+        let path = temp.path().join("Alice Smith.md");
+        let initial = "---\ntitle: \"Alice Smith\"\ntype: person\nrelated:\n  - \"[[2025-01-10_meeting]]\"\nlast-contact: \"2025-01-10\"\n---\n\n# Alice Smith\n\n## Notes\n- From [[2025-01-10_meeting]]: Initial context\n";
+        fs::write(&path, initial).unwrap();
+        enrich_person_note(&path, &["New Alias"], "Discussed migration", "2025-01-15_standup", "2025-01-15", &tmp_dir).unwrap();
+        let content = fs::read_to_string(&path).unwrap();
+        assert!(content.contains("[[2025-01-10_meeting]]"));
+        assert!(content.contains("[[2025-01-15_standup]]"));
+        assert!(content.contains("Discussed migration"));
+        assert!(content.contains("last-contact: 2025-01-15") || content.contains("last-contact: \"2025-01-15\""));
+    }
+
+    #[test]
+    fn test_enrich_person_note_no_duplicate_related() {
+        let temp = TempDir::new().unwrap();
+        let tmp_dir = temp.path().join("tmp");
+        fs::create_dir_all(&tmp_dir).unwrap();
+        let path = temp.path().join("test.md");
+        let initial = "---\ntitle: \"Alice\"\ntype: person\nrelated:\n  - \"[[2025-01-15_standup]]\"\nlast-contact: \"2025-01-15\"\n---\n\n# Alice\n\n## Notes\n- From [[2025-01-15_standup]]: Initial note\n";
+        fs::write(&path, &initial).unwrap();
+        enrich_person_note(&path, &[], "Again", "2025-01-15_standup", "2025-01-15", &tmp_dir).unwrap();
+        let content = fs::read_to_string(&path).unwrap();
+        // related has 1 entry (no dup), Notes has original + new bullet = 2 mentions, total = 3
+        let count = content.matches("2025-01-15_standup").count();
+        assert_eq!(count, 3);
+    }
+
+    #[test]
+    fn test_enrich_person_note_missing_notes_section() {
+        let temp = TempDir::new().unwrap();
+        let tmp_dir = temp.path().join("tmp");
+        fs::create_dir_all(&tmp_dir).unwrap();
+        let path = temp.path().join("test.md");
+        let initial = "---\ntitle: \"Alice\"\ntype: person\nrelated: []\n---\n\n# Alice\n\n## Context\n- Engineer\n";
+        fs::write(&path, &initial).unwrap();
+        enrich_person_note(&path, &[], "New context", "2025-01-15_standup", "2025-01-15", &tmp_dir).unwrap();
+        let content = fs::read_to_string(&path).unwrap();
+        assert!(content.contains("## Notes\n"));
+        assert!(content.contains("New context"));
+    }
+
+    #[test]
+    fn test_create_concept_note() {
+        let temp = TempDir::new().unwrap();
+        let dir = temp.path().join("Concepts");
+        fs::create_dir_all(&dir).unwrap();
+        let tmp_dir = temp.path().join("tmp");
+        fs::create_dir_all(&tmp_dir).unwrap();
+        create_concept_note(&dir, "API-First Design", "Building APIs before UIs", "2025-01-15_standup", "2025-01-15", &tmp_dir).unwrap();
+        let path = dir.join("API-First Design.md");
+        assert!(path.exists());
+        let content = fs::read_to_string(&path).unwrap();
+        assert!(content.contains("title: \"API-First Design\""));
+        assert!(content.contains("Building APIs before UIs"));
+        assert!(content.contains("[[2025-01-15_standup]]"));
+    }
+
+    #[test]
+    fn test_create_project_note() {
+        let temp = TempDir::new().unwrap();
+        let dir = temp.path().join("Projects");
+        fs::create_dir_all(&dir).unwrap();
+        let tmp_dir = temp.path().join("tmp");
+        fs::create_dir_all(&tmp_dir).unwrap();
+        create_project_note(&dir, "Project Atlas", "Internal migration tool", "2025-01-15_standup", "2025-01-15", &tmp_dir).unwrap();
+        let path = dir.join("Project Atlas.md");
+        assert!(path.exists());
+        let content = fs::read_to_string(&path).unwrap();
+        assert!(content.contains("title: \"Project Atlas\""));
+        assert!(content.contains("Internal migration tool"));
+    }
+
+    #[test]
+    fn test_find_entity_file_case_insensitive() {
+        let temp = TempDir::new().unwrap();
+        let dir = temp.path().join("Concepts");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("API-First Design.md"), "# test").unwrap();
+        let result = find_entity_file(&dir, "api-first design");
+        assert!(result.is_some());
+    }
+
+    #[test]
+    fn test_find_entity_file_no_match() {
+        let temp = TempDir::new().unwrap();
+        let dir = temp.path().join("Concepts");
+        fs::create_dir_all(&dir).unwrap();
+        let result = find_entity_file(&dir, "Nonexistent");
+        assert!(result.is_none());
     }
 }
