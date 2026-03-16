@@ -75,6 +75,175 @@ pub(crate) fn save_summary_cache(
     Ok(())
 }
 
+#[cfg(feature = "summaries")]
+pub(crate) struct SummarizationContext<'a> {
+    pub config: &'a crate::summary::SummaryConfig,
+    pub api_key: &'a str,
+    pub client: &'a reqwest::blocking::Client,
+    pub context_preamble: &'a mut String,
+    pub paths: &'a Paths,
+    pub people_index: &'a mut crate::storage::PeopleIndex,
+    pub summary_cache: &'a mut HashMap<String, SummaryCacheEntry>,
+    pub summary_cache_path: &'a std::path::Path,
+    pub dry_run: bool,
+}
+
+/// Summarize a document and reconcile extracted entities.
+///
+/// Returns the summary text and extracted entities on success.
+/// Updates the summary cache after successful summarization.
+#[cfg(feature = "summaries")]
+pub(crate) fn summarize_and_reconcile(
+    ctx: &mut SummarizationContext,
+    doc_id: &str,
+    transcript: &crate::model::RawTranscript,
+    meta: &crate::model::DocumentMetadata,
+    slug: &str,
+    attendee_names: &[String],
+) -> Result<(Option<String>, Option<crate::summary::ExtractedEntities>)> {
+    let word_count = crate::util::count_transcript_words(transcript);
+    if word_count < 20 {
+        return Ok((None, None));
+    }
+
+    let input = crate::summary::format_transcript_for_llm(transcript, meta);
+    let (summary_text, extracted_entities) = match crate::summary::summarize_transcript(
+        &input,
+        ctx.api_key,
+        ctx.config,
+        ctx.client,
+        ctx.context_preamble,
+    ) {
+        Ok(raw_summary) => {
+            let (clean_md, entities) = crate::summary::parse_summary_output(&raw_summary);
+            (Some(clean_md), entities)
+        }
+        Err(e) => {
+            eprintln!("Warning: Failed to summarize {}: {}", doc_id, e);
+            return Ok((None, None));
+        }
+    };
+
+    // Entity reconciliation
+    if let Some(ref entities) = extracted_entities {
+        if !ctx.dry_run {
+            let date = meta.created_at.format("%Y-%m-%d").to_string();
+            let meeting_slug = format!("{}_{}", date, slug);
+
+            // People
+            for person in &entities.people {
+                let match_result = ctx.people_index.find_match(&person.name, attendee_names);
+                if let Some((canonical, existing_path)) = match_result {
+                    let alias_refs: Vec<&str> = person.aliases.iter().map(|s| s.as_str()).collect();
+                    if let Err(e) = crate::storage::enrich_person_note(
+                        &existing_path,
+                        &alias_refs,
+                        &person.context,
+                        &meeting_slug,
+                        &date,
+                        &ctx.paths.tmp_dir,
+                    ) {
+                        eprintln!("Warning: Failed to enrich People/{}: {}", canonical, e);
+                    }
+                } else if person.name.contains(' ') {
+                    let people_dir = ctx.paths.vault_dir.join("People");
+                    let alias_refs: Vec<&str> = person.aliases.iter().map(|s| s.as_str()).collect();
+                    if let Err(e) = crate::storage::create_person_note(
+                        &people_dir,
+                        &person.name,
+                        person.role.as_deref(),
+                        person.company.as_deref(),
+                        &alias_refs,
+                        &person.context,
+                        &meeting_slug,
+                        &date,
+                        &ctx.paths.tmp_dir,
+                    ) {
+                        eprintln!("Warning: Failed to create People/{}: {}", person.name, e);
+                    } else {
+                        ctx.people_index
+                            .add_person(&person.name, &people_dir, &alias_refs);
+                    }
+                }
+            }
+
+            // Concepts
+            let concepts_dir = ctx.paths.vault_dir.join("Concepts");
+            for concept in &entities.concepts {
+                let existing = crate::storage::find_entity_file(&concepts_dir, &concept.name);
+                if let Some(existing_path) = existing {
+                    if let Err(e) = crate::storage::enrich_concept_note(
+                        &existing_path,
+                        &meeting_slug,
+                        &date,
+                        &ctx.paths.tmp_dir,
+                    ) {
+                        eprintln!("Warning: Failed to enrich Concepts/{}: {}", concept.name, e);
+                    }
+                } else if let Err(e) = crate::storage::create_concept_note(
+                    &concepts_dir,
+                    &concept.name,
+                    &concept.description,
+                    &meeting_slug,
+                    &date,
+                    &ctx.paths.tmp_dir,
+                ) {
+                    eprintln!("Warning: Failed to create Concepts/{}: {}", concept.name, e);
+                } else {
+                    *ctx.context_preamble =
+                        crate::summary::build_context_preamble(&ctx.paths.vault_dir);
+                }
+            }
+
+            // Projects
+            let projects_dir = ctx.paths.vault_dir.join("Projects");
+            for project in &entities.projects {
+                let existing = crate::storage::find_entity_file(&projects_dir, &project.name);
+                if let Some(existing_path) = existing {
+                    if let Err(e) = crate::storage::enrich_project_note(
+                        &existing_path,
+                        &project.description,
+                        &meeting_slug,
+                        &ctx.paths.tmp_dir,
+                    ) {
+                        eprintln!("Warning: Failed to enrich Projects/{}: {}", project.name, e);
+                    }
+                } else if let Err(e) = crate::storage::create_project_note(
+                    &projects_dir,
+                    &project.name,
+                    &project.description,
+                    &meeting_slug,
+                    &date,
+                    &ctx.paths.tmp_dir,
+                ) {
+                    eprintln!("Warning: Failed to create Projects/{}: {}", project.name, e);
+                } else {
+                    *ctx.context_preamble =
+                        crate::summary::build_context_preamble(&ctx.paths.vault_dir);
+                }
+            }
+        }
+    }
+
+    // Update summary cache
+    if summary_text.is_some() && !ctx.dry_run {
+        ctx.summary_cache.insert(
+            doc_id.to_string(),
+            SummaryCacheEntry {
+                summarized_at: Utc::now(),
+                model: ctx.config.model.clone(),
+            },
+        );
+        save_summary_cache(
+            ctx.summary_cache_path,
+            ctx.summary_cache,
+            &ctx.paths.tmp_dir,
+        )?;
+    }
+
+    Ok((summary_text, extracted_entities))
+}
+
 /// Sync all documents from the Granola API into the vault.
 ///
 /// Fetches the document list, compares against a local cache, and writes
