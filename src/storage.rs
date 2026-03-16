@@ -726,6 +726,113 @@ pub fn enrich_project_note(
     write_atomic(path, full.as_bytes(), tmp_dir)
 }
 
+/// Merge new `related` wiki-links into an existing markdown file's frontmatter.
+/// Performs a set union — preserves existing links, adds new ones, deduplicates.
+/// Uses string manipulation to preserve field order and formatting.
+pub fn merge_frontmatter_related(
+    md_path: &Path,
+    new_links: &[String],
+    tmp_dir: &Path,
+) -> Result<()> {
+    if new_links.is_empty() {
+        return Ok(());
+    }
+
+    let content = fs::read_to_string(md_path)?;
+
+    // Find frontmatter boundaries (between first and second "---")
+    let Some(fm_start) = content.find("---\n") else {
+        return Ok(());
+    };
+    let fm_content_start = fm_start + 4;
+    let Some(fm_end_offset) = content[fm_content_start..].find("\n---") else {
+        return Ok(());
+    };
+    let fm_end = fm_content_start + fm_end_offset;
+    let fm_str = &content[fm_content_start..fm_end];
+
+    // Collect existing related links from the frontmatter text
+    let mut existing_links: Vec<String> = Vec::new();
+    let mut related_section_start: Option<usize> = None;
+    let mut related_section_end: usize = fm_str.len();
+
+    if let Some(rel_offset) = fm_str.find("\nrelated:") {
+        related_section_start = Some(rel_offset + 1); // skip leading \n
+                                                      // Parse the list items following "related:"
+        let after_key = &fm_str[rel_offset + "\nrelated:".len()..];
+        for line in after_key.lines() {
+            let trimmed = line.trim();
+            if trimmed.starts_with("- ") {
+                let value = trimmed[2..].trim().trim_matches('"').trim_matches('\'');
+                existing_links.push(value.to_string());
+            } else if !trimmed.is_empty() {
+                // Hit the next YAML key — mark end of related section
+                let line_start = fm_str.len() - after_key.len()
+                    + (line.as_ptr() as usize - after_key.as_ptr() as usize);
+                related_section_end = line_start;
+                break;
+            }
+        }
+    } else if fm_str.starts_with("related:") {
+        related_section_start = Some(0);
+        let after_key = &fm_str["related:".len()..];
+        for line in after_key.lines() {
+            let trimmed = line.trim();
+            if trimmed.starts_with("- ") {
+                let value = trimmed[2..].trim().trim_matches('"').trim_matches('\'');
+                existing_links.push(value.to_string());
+            } else if !trimmed.is_empty() {
+                let line_start = fm_str.len() - after_key.len()
+                    + (line.as_ptr() as usize - after_key.as_ptr() as usize);
+                related_section_end = line_start;
+                break;
+            }
+        }
+    }
+
+    // Merge: add new links not already present
+    let mut merged = existing_links.clone();
+    for link in new_links {
+        if !merged.contains(link) {
+            merged.push(link.clone());
+        }
+    }
+
+    // If nothing new to add, skip the write
+    if merged.len() == existing_links.len() {
+        return Ok(());
+    }
+
+    // Build the new related: block
+    let mut related_block = String::from("related:\n");
+    for link in &merged {
+        related_block.push_str(&format!("  - \"{}\"\n", link));
+    }
+
+    // Reconstruct frontmatter
+    let new_fm = if let Some(start) = related_section_start {
+        // Replace existing related section
+        let mut result = String::new();
+        result.push_str(&fm_str[..start]);
+        result.push_str(&related_block);
+        if related_section_end < fm_str.len() {
+            result.push_str(&fm_str[related_section_end..]);
+        }
+        result
+    } else {
+        // No existing related section — append before closing ---
+        format!("{}\n{}", fm_str, related_block)
+    };
+
+    // Reconstruct file
+    let mut result = String::new();
+    result.push_str(&content[..fm_content_start]);
+    result.push_str(&new_fm);
+    result.push_str(&content[fm_end..]);
+
+    write_atomic(md_path, result.as_bytes(), tmp_dir)
+}
+
 /// Extract the `aliases` array from YAML frontmatter in a markdown file.
 fn parse_aliases_from_frontmatter(content: &str) -> Option<Vec<String>> {
     if !content.starts_with("---\n") {
@@ -1286,5 +1393,78 @@ mod entity_note_tests {
         fs::create_dir_all(&dir).unwrap();
         let result = find_entity_file(&dir, "Nonexistent");
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn test_merge_frontmatter_related_adds_new_links() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let md_path = temp.path().join("test.md");
+        let tmp_dir = temp.path().join("tmp");
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+
+        std::fs::write(
+            &md_path,
+            "---\ndoc_id: doc123\nsource: granola\ncreated: 2025-10-28T15:04:05Z\ngenerator: baez\nrelated:\n  - \"[[Alice]]\"\n---\n\n# Meeting\n",
+        ).unwrap();
+
+        let new_links = vec![
+            "[[Alice]]".to_string(),
+            "[[Bob]]".to_string(),
+            "[[API Design]]".to_string(),
+        ];
+        merge_frontmatter_related(&md_path, &new_links, &tmp_dir).unwrap();
+
+        let content = std::fs::read_to_string(&md_path).unwrap();
+        assert!(content.contains("[[Alice]]"));
+        assert!(content.contains("[[Bob]]"));
+        assert!(content.contains("[[API Design]]"));
+        // Should not duplicate Alice
+        let alice_count = content.matches("[[Alice]]").count();
+        assert_eq!(
+            alice_count, 1,
+            "Alice should appear exactly once in related"
+        );
+        // Verify frontmatter structure is preserved
+        assert!(content.starts_with("---\n"));
+        assert!(content.contains("\n---\n"));
+    }
+
+    #[test]
+    fn test_merge_frontmatter_related_no_existing_related() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let md_path = temp.path().join("test.md");
+        let tmp_dir = temp.path().join("tmp");
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+
+        std::fs::write(
+            &md_path,
+            "---\ndoc_id: doc123\nsource: granola\ncreated: 2025-10-28T15:04:05Z\ngenerator: baez\n---\n\n# Meeting\n",
+        ).unwrap();
+
+        let new_links = vec!["[[Bob]]".to_string()];
+        merge_frontmatter_related(&md_path, &new_links, &tmp_dir).unwrap();
+
+        let content = std::fs::read_to_string(&md_path).unwrap();
+        assert!(content.contains("[[Bob]]"));
+        // Field order should be preserved — generator still before related
+        assert!(content.contains("generator: baez\nrelated:"));
+    }
+
+    #[test]
+    fn test_merge_frontmatter_related_no_frontmatter() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let md_path = temp.path().join("test.md");
+        let tmp_dir = temp.path().join("tmp");
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+
+        let original = "# Meeting\n\nNo frontmatter here.\n";
+        std::fs::write(&md_path, original).unwrap();
+
+        let new_links = vec!["[[Bob]]".to_string()];
+        merge_frontmatter_related(&md_path, &new_links, &tmp_dir).unwrap();
+
+        // File should be unchanged
+        let content = std::fs::read_to_string(&md_path).unwrap();
+        assert_eq!(content, original);
     }
 }
