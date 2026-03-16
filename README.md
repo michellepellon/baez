@@ -12,6 +12,8 @@ optional AI summaries powered by Claude.
 - Preserves raw JSON API responses for archival
 - Incremental sync — only fetches documents that changed since last run
 - Generates AI meeting summaries using Claude (Anthropic API), with Obsidian-native formatting
+- Extracts a knowledge graph — People, Concepts, and Projects notes with `[[wiki-links]]` across meetings
+- Resumable summarization — picks up where it left off if interrupted
 
 ## Install
 
@@ -131,6 +133,10 @@ most secure option for the Anthropic API key.
 baez sync                  Sync all documents (with AI summaries if key is set)
 baez sync --force          Force re-sync, ignoring cache
 baez sync --no-summarize   Sync without AI summaries
+baez sync --dry-run        Preview what would be synced
+baez summarize-all         Batch-summarize all unsummarized docs (no API fetch needed)
+baez summarize-all --force Re-summarize everything
+baez summarize-all --dry-run Preview what would be summarized
 baez list                  List all documents
 baez fetch <id>            Fetch a specific document
 baez open                  Open vault directory
@@ -140,12 +146,20 @@ baez fix-dates             Fix file modification dates
 ### AI Summaries
 
 Summaries are generated during `baez sync` when an Anthropic API key is
-available. You can also summarize individual documents:
+available. If sync is interrupted, re-running `baez sync` or
+`baez summarize-all` picks up where it left off — already-summarized docs are
+tracked in a separate summary cache and skipped automatically.
 
 ```sh
 baez summarize <doc-id>           Print summary to stdout
 baez summarize <doc-id> --save    Update the ## Summary section in the markdown file
+baez summarize-all                Batch-summarize all unsummarized docs from local files
+baez summarize-all --force        Re-summarize everything (e.g. after changing model)
 ```
+
+`summarize-all` reads from the raw JSON files already on disk — it never hits
+the Granola API. This makes it safe to run repeatedly and useful for catching up
+after enabling summarization on an existing vault.
 
 Configure the model and input limits:
 
@@ -157,12 +171,35 @@ baez set-config --prompt-file my-prompt.txt       Use a custom prompt
 ```
 
 The default model is `claude-opus-4-6` with a 600,000 character input limit
-(~150K tokens) and 4,096 max output tokens.
+(~150K tokens) and 8,192 max output tokens.
+
+### Knowledge Graph
+
+When summarization is enabled, baez extracts entities from each meeting and
+creates interconnected notes in your vault:
+
+```
+Vault/
+├── People/              # One note per person mentioned across meetings
+│   └── Alice Smith.md
+├── Concepts/            # Reusable ideas and patterns
+│   └── API Design.md
+└── Projects/            # Projects discussed in meetings
+    └── Project Atlas.md
+```
+
+Each entity note tracks which meetings it appeared in via `## Sources` links.
+Meeting notes link back via `related` frontmatter fields. The result is a
+navigable knowledge graph in Obsidian's graph view — people, concepts, and
+projects connected through meetings.
 
 ## Vault layout
 
 ```
 Vault/
+├── People/                       # Entity notes (auto-created)
+├── Concepts/
+├── Projects/
 └── Granola/
     ├── 2025/
     │   ├── 01/
@@ -172,10 +209,10 @@ Vault/
     │       └── ...
     └── .baez/
         ├── raw/                  # Raw JSON API responses
-        ├── summaries/            # AI-generated summaries
         ├── tmp/                  # Atomic write temp dir
         ├── summary_config.json   # Summarization settings
-        └── .sync_cache.json      # Incremental sync state
+        ├── .sync_cache.json      # Incremental sync state
+        └── .summary_cache.json   # Summarization progress tracking
 ```
 
 ## Markdown format
@@ -191,6 +228,10 @@ title: Sprint Planning
 attendees: [Alice, Bob]
 duration_minutes: 30
 tags: [planning]
+related:
+  - "[[Alice Smith]]"
+  - "[[API Design]]"
+status: substantive
 generator: baez
 ```
 
