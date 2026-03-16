@@ -803,6 +803,48 @@ pub fn summarize_all_docs(paths: &Paths, force: bool, verbose: bool, dry_run: bo
         return Ok(());
     }
 
+    // Pre-populate summary cache: scan existing markdown files for ## Summary sections.
+    // This handles docs that were summarized before the summary cache existed.
+    if summary_cache.is_empty() && !force {
+        let mut backfilled = 0u32;
+        for (doc_id, cache_entry) in &sync_cache {
+            // Parse date from filename to compute doc_path
+            let slug_part = cache_entry
+                .filename
+                .get(11..)
+                .unwrap_or(&cache_entry.filename);
+            if let Some(date_str) = cache_entry.filename.get(..10) {
+                if let Ok(parsed) = chrono::NaiveDate::parse_from_str(date_str, "%Y-%m-%d") {
+                    if let Some(dt) = parsed.and_hms_opt(0, 0, 0) {
+                        let created = DateTime::<Utc>::from_naive_utc_and_offset(dt, Utc);
+                        let doc_path = paths.doc_path(&created, slug_part);
+                        if doc_path.exists() {
+                            if let Ok(content) = std::fs::read_to_string(&doc_path) {
+                                if content.contains("\n## Summary\n") {
+                                    summary_cache.insert(
+                                        doc_id.clone(),
+                                        SummaryCacheEntry {
+                                            summarized_at: Utc::now(),
+                                            model: "unknown (backfilled)".to_string(),
+                                        },
+                                    );
+                                    backfilled += 1;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if backfilled > 0 {
+            save_summary_cache(&summary_cache_path, &summary_cache, &paths.tmp_dir)?;
+            println!(
+                "Backfilled summary cache with {} previously-summarized docs",
+                backfilled
+            );
+        }
+    }
+
     // Collect docs to process
     let to_process: Vec<(&String, &CacheEntry)> = sync_cache
         .iter()
@@ -871,7 +913,7 @@ pub fn summarize_all_docs(paths: &Paths, force: bool, verbose: bool, dry_run: bo
             }
         };
 
-        let meta = match std::fs::read_to_string(&metadata_path)
+        let mut meta = match std::fs::read_to_string(&metadata_path)
             .ok()
             .and_then(|s| serde_json::from_str::<crate::model::DocumentMetadata>(&s).ok())
         {
@@ -883,6 +925,18 @@ pub fn summarize_all_docs(paths: &Paths, force: bool, verbose: bool, dry_run: bo
                 continue;
             }
         };
+
+        // Override created_at from the sync cache filename (YYYY-MM-DD_slug format)
+        // because the metadata JSON's created_at can default to Utc::now() when the
+        // API omitted it. The sync loop fixes this from doc_summary.created_at, but
+        // we only have the raw JSON here.
+        if let Some(date_str) = cache_entry.filename.get(..10) {
+            if let Ok(parsed) = chrono::NaiveDate::parse_from_str(date_str, "%Y-%m-%d") {
+                if let Some(dt) = parsed.and_hms_opt(0, 0, 0) {
+                    meta.created_at = DateTime::<Utc>::from_naive_utc_and_offset(dt, Utc);
+                }
+            }
+        }
 
         // Check word count
         let word_count = crate::util::count_transcript_words(&transcript);

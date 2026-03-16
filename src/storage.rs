@@ -762,8 +762,8 @@ pub fn merge_frontmatter_related(
         let after_key = &fm_str[rel_offset + "\nrelated:".len()..];
         for line in after_key.lines() {
             let trimmed = line.trim();
-            if trimmed.starts_with("- ") {
-                let value = trimmed[2..].trim().trim_matches('"').trim_matches('\'');
+            if let Some(stripped) = trimmed.strip_prefix("- ") {
+                let value = stripped.trim().trim_matches('"').trim_matches('\'');
                 existing_links.push(value.to_string());
             } else if !trimmed.is_empty() {
                 // Hit the next YAML key — mark end of related section
@@ -773,13 +773,12 @@ pub fn merge_frontmatter_related(
                 break;
             }
         }
-    } else if fm_str.starts_with("related:") {
+    } else if let Some(after_key) = fm_str.strip_prefix("related:") {
         related_section_start = Some(0);
-        let after_key = &fm_str["related:".len()..];
         for line in after_key.lines() {
             let trimmed = line.trim();
-            if trimmed.starts_with("- ") {
-                let value = trimmed[2..].trim().trim_matches('"').trim_matches('\'');
+            if let Some(stripped) = trimmed.strip_prefix("- ") {
+                let value = stripped.trim().trim_matches('"').trim_matches('\'');
                 existing_links.push(value.to_string());
             } else if !trimmed.is_empty() {
                 let line_start = fm_str.len() - after_key.len()
