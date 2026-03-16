@@ -6,7 +6,7 @@ use crate::{
     api::ApiClient,
     convert::to_markdown,
     storage::{read_frontmatter, set_file_time, write_atomic, Paths},
-    util::{count_transcript_words, slugify},
+    util::count_transcript_words,
     Result,
 };
 use chrono::{DateTime, Utc};
@@ -335,6 +335,16 @@ pub fn sync_all(
     let cache_path = paths.baez_dir.join(".sync_cache.json");
     let mut cache = load_cache(&cache_path);
 
+    // Load the summary cache (tracks which docs have been summarized)
+    #[cfg(feature = "summaries")]
+    let summary_cache_path = paths.baez_dir.join(".summary_cache.json");
+    #[cfg(feature = "summaries")]
+    let mut summary_cache = if summarize_state.is_some() {
+        load_summary_cache(&summary_cache_path)
+    } else {
+        HashMap::new()
+    };
+
     let pb = ProgressBar::new(docs.len() as u64);
     pb.set_style(
         ProgressStyle::default_bar()
@@ -353,6 +363,8 @@ pub fn sync_all(
     let mut concepts_count = 0u32;
     #[cfg(feature = "summaries")]
     let mut projects_count = 0u32;
+    #[cfg(feature = "summaries")]
+    let mut summarize_only = 0u32;
 
     for doc_summary in &docs {
         // Check cache for quick timestamp comparison (--force bypasses cache)
@@ -366,6 +378,155 @@ pub fn sync_all(
         };
 
         if !should_update {
+            // Summarize-only path: doc is sync-cached but may need summarization
+            #[cfg(feature = "summaries")]
+            if !dry_run {
+                if let Some((ref config, ref key, ref claude_client)) = summarize_state {
+                    if !summary_cache.contains_key(&doc_summary.id) {
+                        // Try to load raw files from cache entry
+                        if let Some(cache_entry) = cache.get(&doc_summary.id) {
+                            let transcript_path = paths
+                                .raw_dir
+                                .join(format!("{}_transcript.json", cache_entry.filename));
+                            let metadata_path = paths
+                                .raw_dir
+                                .join(format!("{}_metadata.json", cache_entry.filename));
+
+                            let raw_ok = (|| -> std::result::Result<
+                                (crate::model::RawTranscript, crate::model::DocumentMetadata),
+                                Box<dyn std::error::Error>,
+                            > {
+                                let t_str = std::fs::read_to_string(&transcript_path)?;
+                                let t: crate::model::RawTranscript = serde_json::from_str(&t_str)?;
+                                let m_str = std::fs::read_to_string(&metadata_path)?;
+                                let mut m: crate::model::DocumentMetadata =
+                                    serde_json::from_str(&m_str)?;
+                                m.created_at = doc_summary.created_at;
+                                Ok((t, m))
+                            })();
+
+                            match raw_ok {
+                                Ok((transcript, meta)) => {
+                                    let slug = crate::util::doc_slug(
+                                        meta.title.as_deref(),
+                                        &doc_summary.id,
+                                    );
+                                    let attendee_names: Vec<String> =
+                                        if let Some(ref rich) = meta.attendees {
+                                            rich.iter().filter_map(|a| a.name.clone()).collect()
+                                        } else {
+                                            meta.participants.clone()
+                                        };
+
+                                    let mut ctx = SummarizationContext {
+                                        config,
+                                        api_key: key,
+                                        client: claude_client,
+                                        context_preamble: &mut context_preamble,
+                                        paths,
+                                        people_index: &mut people_index,
+                                        summary_cache: &mut summary_cache,
+                                        summary_cache_path: &summary_cache_path,
+                                        dry_run,
+                                    };
+
+                                    match summarize_and_reconcile(
+                                        &mut ctx,
+                                        &doc_summary.id,
+                                        &transcript,
+                                        &meta,
+                                        &slug,
+                                        &attendee_names,
+                                    ) {
+                                        Ok((Some(summary_text), extracted_entities)) => {
+                                            // Update the existing markdown file with summary
+                                            let doc_path = paths.doc_path(&meta.created_at, &slug);
+                                            if doc_path.exists() {
+                                                match std::fs::read_to_string(&doc_path) {
+                                                    Ok(existing_md) => {
+                                                        let updated = crate::summary::update_summary_in_markdown(
+                                                            &existing_md,
+                                                            &summary_text,
+                                                        );
+                                                        if let Err(e) = write_atomic(
+                                                            &doc_path,
+                                                            updated.as_bytes(),
+                                                            &paths.tmp_dir,
+                                                        ) {
+                                                            eprintln!(
+                                                                "Warning: Failed to update summary in {}: {}",
+                                                                doc_path.display(),
+                                                                e
+                                                            );
+                                                        }
+                                                    }
+                                                    Err(e) => {
+                                                        eprintln!(
+                                                            "Warning: Failed to read {}: {}",
+                                                            doc_path.display(),
+                                                            e
+                                                        );
+                                                    }
+                                                }
+                                            }
+
+                                            // Merge frontmatter related links
+                                            if let Some(ref entities) = extracted_entities {
+                                                let mut related = Vec::new();
+                                                for p in &entities.people {
+                                                    related.push(format!("[[{}]]", p.name));
+                                                }
+                                                for c in &entities.concepts {
+                                                    related.push(format!("[[{}]]", c.name));
+                                                }
+                                                for pr in &entities.projects {
+                                                    related.push(format!("[[{}]]", pr.name));
+                                                }
+                                                if let Err(e) =
+                                                    crate::storage::merge_frontmatter_related(
+                                                        &doc_path,
+                                                        &related,
+                                                        &paths.tmp_dir,
+                                                    )
+                                                {
+                                                    eprintln!(
+                                                        "Warning: Failed to merge related links in {}: {}",
+                                                        doc_path.display(),
+                                                        e
+                                                    );
+                                                }
+
+                                                people_count += entities.people.len() as u32;
+                                                concepts_count += entities.concepts.len() as u32;
+                                                projects_count += entities.projects.len() as u32;
+                                            }
+
+                                            summarize_only += 1;
+                                            summarized += 1;
+                                        }
+                                        Ok((None, _)) => {
+                                            // No summary produced (e.g. too short)
+                                        }
+                                        Err(e) => {
+                                            eprintln!(
+                                                "Warning: Catch-up summarization failed for {}: {}",
+                                                doc_summary.id, e
+                                            );
+                                        }
+                                    }
+                                }
+                                Err(e) => {
+                                    eprintln!(
+                                        "Warning: Cannot load raw files for catch-up summary of {}: {}",
+                                        doc_summary.id, e
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
             skipped += 1;
             pb.inc(1);
             continue;
@@ -412,19 +573,44 @@ pub fn sync_all(
             Option<crate::summary::ExtractedEntities>,
         ) = if status == "substantive" {
             if let Some((ref config, ref key, ref claude_client)) = summarize_state {
-                let input = crate::summary::format_transcript_for_llm(&transcript, &meta);
-                match crate::summary::summarize_transcript(
-                    &input,
-                    key,
+                let slug_for_summary =
+                    crate::util::doc_slug(meta.title.as_deref(), &doc_summary.id);
+                let attendee_names: Vec<String> = if let Some(ref rich) = meta.attendees {
+                    rich.iter().filter_map(|a| a.name.clone()).collect()
+                } else {
+                    meta.participants.clone()
+                };
+
+                let mut ctx = SummarizationContext {
                     config,
-                    claude_client,
-                    &context_preamble,
+                    api_key: key,
+                    client: claude_client,
+                    context_preamble: &mut context_preamble,
+                    paths,
+                    people_index: &mut people_index,
+                    summary_cache: &mut summary_cache,
+                    summary_cache_path: &summary_cache_path,
+                    dry_run,
+                };
+
+                match summarize_and_reconcile(
+                    &mut ctx,
+                    &doc_summary.id,
+                    &transcript,
+                    &meta,
+                    &slug_for_summary,
+                    &attendee_names,
                 ) {
-                    Ok(raw_summary) => {
-                        summarized += 1;
-                        let (clean_md, entities) =
-                            crate::summary::parse_summary_output(&raw_summary);
-                        (Some(clean_md), entities)
+                    Ok((summary, entities)) => {
+                        if summary.is_some() {
+                            summarized += 1;
+                        }
+                        if let Some(ref ents) = entities {
+                            people_count += ents.people.len() as u32;
+                            concepts_count += ents.concepts.len() as u32;
+                            projects_count += ents.projects.len() as u32;
+                        }
+                        (summary, entities)
                     }
                     Err(e) => {
                         eprintln!("Warning: Failed to summarize {}: {}", doc_summary.id, e);
@@ -534,118 +720,6 @@ pub fn sync_all(
         set_file_time(&metadata_json_path, &meta.created_at)?;
         set_file_time(&doc_path, &meta.created_at)?;
 
-        // Entity reconciliation: create/update People, Concepts, Projects notes
-        #[cfg(feature = "summaries")]
-        if let Some(ref entities) = extracted_entities {
-            if entity_dirs_ready && !dry_run {
-                let date = meta.created_at.format("%Y-%m-%d").to_string();
-                let meeting_slug = format!("{}_{}", date, slug);
-
-                // Extract attendee names for disambiguation
-                let attendee_names: Vec<String> = if let Some(ref rich) = meta.attendees {
-                    rich.iter().filter_map(|a| a.name.clone()).collect()
-                } else {
-                    meta.participants.clone()
-                };
-
-                // People
-                for person in &entities.people {
-                    let match_result = people_index.find_match(&person.name, &attendee_names);
-                    if let Some((canonical, existing_path)) = match_result {
-                        let alias_refs: Vec<&str> =
-                            person.aliases.iter().map(|s| s.as_str()).collect();
-                        if let Err(e) = crate::storage::enrich_person_note(
-                            &existing_path,
-                            &alias_refs,
-                            &person.context,
-                            &meeting_slug,
-                            &date,
-                            &paths.tmp_dir,
-                        ) {
-                            eprintln!("Warning: Failed to enrich People/{}: {}", canonical, e);
-                        }
-                    } else if person.name.contains(' ') {
-                        let people_dir = paths.vault_dir.join("People");
-                        let alias_refs: Vec<&str> =
-                            person.aliases.iter().map(|s| s.as_str()).collect();
-                        if let Err(e) = crate::storage::create_person_note(
-                            &people_dir,
-                            &person.name,
-                            person.role.as_deref(),
-                            person.company.as_deref(),
-                            &alias_refs,
-                            &person.context,
-                            &meeting_slug,
-                            &date,
-                            &paths.tmp_dir,
-                        ) {
-                            eprintln!("Warning: Failed to create People/{}: {}", person.name, e);
-                        } else {
-                            people_index.add_person(&person.name, &people_dir, &alias_refs);
-                        }
-                    }
-                    people_count += 1;
-                }
-
-                // Concepts
-                let concepts_dir = paths.vault_dir.join("Concepts");
-                for concept in &entities.concepts {
-                    let existing = crate::storage::find_entity_file(&concepts_dir, &concept.name);
-                    if let Some(existing_path) = existing {
-                        if let Err(e) = crate::storage::enrich_concept_note(
-                            &existing_path,
-                            &meeting_slug,
-                            &date,
-                            &paths.tmp_dir,
-                        ) {
-                            eprintln!("Warning: Failed to enrich Concepts/{}: {}", concept.name, e);
-                        }
-                    } else if let Err(e) = crate::storage::create_concept_note(
-                        &concepts_dir,
-                        &concept.name,
-                        &concept.description,
-                        &meeting_slug,
-                        &date,
-                        &paths.tmp_dir,
-                    ) {
-                        eprintln!("Warning: Failed to create Concepts/{}: {}", concept.name, e);
-                    } else {
-                        // Update context preamble so subsequent meetings see this concept
-                        context_preamble = crate::summary::build_context_preamble(&paths.vault_dir);
-                    }
-                    concepts_count += 1;
-                }
-
-                // Projects
-                let projects_dir = paths.vault_dir.join("Projects");
-                for project in &entities.projects {
-                    let existing = crate::storage::find_entity_file(&projects_dir, &project.name);
-                    if let Some(existing_path) = existing {
-                        if let Err(e) = crate::storage::enrich_project_note(
-                            &existing_path,
-                            &project.description,
-                            &meeting_slug,
-                            &paths.tmp_dir,
-                        ) {
-                            eprintln!("Warning: Failed to enrich Projects/{}: {}", project.name, e);
-                        }
-                    } else if let Err(e) = crate::storage::create_project_note(
-                        &projects_dir,
-                        &project.name,
-                        &project.description,
-                        &meeting_slug,
-                        &date,
-                        &paths.tmp_dir,
-                    ) {
-                        eprintln!("Warning: Failed to create Projects/{}: {}", project.name, e);
-                    } else {
-                        context_preamble = crate::summary::build_context_preamble(&paths.vault_dir);
-                    }
-                    projects_count += 1;
-                }
-            }
-        }
-
         // Update cache - CRITICAL: store the same timestamp we compare against
         // (doc_summary.updated_at, NOT meta.updated_at - they can differ!)
         let stored_ts = doc_summary.updated_at.unwrap_or(doc_summary.created_at);
@@ -665,11 +739,12 @@ pub fn sync_all(
 
     #[cfg(feature = "summaries")]
     let stats_msg = format!(
-        "synced {} docs ({} new/updated, {} skipped, {} summarized, {} people, {} concepts, {} projects)",
+        "synced {} docs ({} new/updated, {} skipped, {} summarized, {} catch-up summarized, {} people, {} concepts, {} projects)",
         docs.len(),
         synced,
         skipped,
         summarized,
+        summarize_only,
         people_count,
         concepts_count,
         projects_count
