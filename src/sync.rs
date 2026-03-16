@@ -43,6 +43,38 @@ fn save_cache(
     Ok(())
 }
 
+#[cfg(feature = "summaries")]
+#[derive(Serialize, Deserialize)]
+pub(crate) struct SummaryCacheEntry {
+    pub summarized_at: DateTime<Utc>,
+    pub model: String,
+}
+
+#[cfg(feature = "summaries")]
+pub(crate) fn load_summary_cache(
+    cache_path: &std::path::Path,
+) -> HashMap<String, SummaryCacheEntry> {
+    if !cache_path.exists() {
+        return HashMap::new();
+    }
+
+    std::fs::read_to_string(cache_path)
+        .ok()
+        .and_then(|s| serde_json::from_str(&s).ok())
+        .unwrap_or_default()
+}
+
+#[cfg(feature = "summaries")]
+pub(crate) fn save_summary_cache(
+    cache_path: &std::path::Path,
+    cache: &HashMap<String, SummaryCacheEntry>,
+    tmp_dir: &std::path::Path,
+) -> Result<()> {
+    let json = serde_json::to_string_pretty(cache)?;
+    write_atomic(cache_path, json.as_bytes(), tmp_dir)?;
+    Ok(())
+}
+
 /// Sync all documents from the Granola API into the vault.
 ///
 /// Fetches the document list, compares against a local cache, and writes
@@ -576,6 +608,44 @@ fn walk_md_files(
 mod tests {
     use crate::storage::Paths;
     use tempfile::TempDir;
+
+    #[cfg(feature = "summaries")]
+    #[test]
+    fn test_summary_cache_roundtrip() {
+        use super::{load_summary_cache, save_summary_cache, SummaryCacheEntry};
+        use chrono::Utc;
+        use std::collections::HashMap;
+
+        let temp = TempDir::new().unwrap();
+        let cache_path = temp.path().join(".summary_cache.json");
+        let tmp_dir = temp.path().join("tmp");
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+
+        let mut cache = HashMap::new();
+        cache.insert(
+            "doc-123".to_string(),
+            SummaryCacheEntry {
+                summarized_at: Utc::now(),
+                model: "claude-sonnet-4-20250514".to_string(),
+            },
+        );
+
+        save_summary_cache(&cache_path, &cache, &tmp_dir).unwrap();
+        let loaded = load_summary_cache(&cache_path);
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded["doc-123"].model, "claude-sonnet-4-20250514");
+    }
+
+    #[cfg(feature = "summaries")]
+    #[test]
+    fn test_summary_cache_load_missing_file() {
+        use super::load_summary_cache;
+
+        let temp = TempDir::new().unwrap();
+        let cache_path = temp.path().join("nonexistent.json");
+        let loaded = load_summary_cache(&cache_path);
+        assert!(loaded.is_empty());
+    }
 
     #[test]
     fn test_sync_creates_directory_structure() {
