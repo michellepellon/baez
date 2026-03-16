@@ -29,6 +29,8 @@ pub use storage::{
     enrich_person_note, enrich_project_note, find_entity_file, read_entity_frontmatter,
     read_frontmatter, write_atomic, Paths, PeopleIndex,
 };
+#[cfg(feature = "summaries")]
+pub use sync::summarize_all_docs;
 pub use sync::sync_all;
 pub use util::{count_transcript_words, doc_slug};
 

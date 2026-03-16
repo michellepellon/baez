@@ -121,6 +121,17 @@ pub enum Commands {
         #[arg(long)]
         save: bool,
     },
+
+    /// Batch-summarize all synced documents that haven't been summarized yet
+    #[cfg(feature = "summaries")]
+    SummarizeAll {
+        /// Force re-summarization of all documents
+        #[arg(long)]
+        force: bool,
+        /// Preview what would be summarized without making changes
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 #[cfg(test)]

@@ -761,6 +761,226 @@ pub fn sync_all(
     Ok(())
 }
 
+/// Batch-summarize all synced documents that haven't been summarized yet.
+///
+/// Reads transcripts from local raw JSON files — does NOT hit the Granola API.
+/// Uses the sync cache as the inventory of known documents.
+#[cfg(feature = "summaries")]
+pub fn summarize_all_docs(paths: &Paths, force: bool, verbose: bool, dry_run: bool) -> Result<()> {
+    use indicatif::{ProgressBar, ProgressStyle};
+
+    let config_path = paths.baez_dir.join("summary_config.json");
+    let config = crate::summary::SummaryConfig::load(&config_path)?;
+
+    let api_key = match crate::summary::get_api_key_verbose(verbose) {
+        Some(key) => key,
+        None => {
+            eprintln!("Error: No Anthropic API key found. Set BAEZ_ANTHROPIC_API_KEY, ANTHROPIC_API_KEY, add anthropic_api_key to ~/.config/baez/config.json, or run `baez set-api-key`.");
+            return Ok(());
+        }
+    };
+
+    let claude_client = crate::summary::build_claude_client()?;
+    println!("Batch summarization (model: {})", config.model);
+
+    // Create entity directories
+    let _ = std::fs::create_dir_all(paths.vault_dir.join("People"));
+    let _ = std::fs::create_dir_all(paths.vault_dir.join("Concepts"));
+    let _ = std::fs::create_dir_all(paths.vault_dir.join("Projects"));
+
+    let mut people_index = crate::storage::PeopleIndex::build(&paths.vault_dir.join("People"));
+    let mut context_preamble = crate::summary::build_context_preamble(&paths.vault_dir);
+
+    // Load caches
+    let sync_cache_path = paths.baez_dir.join(".sync_cache.json");
+    let sync_cache = load_cache(&sync_cache_path);
+
+    let summary_cache_path = paths.baez_dir.join(".summary_cache.json");
+    let mut summary_cache = load_summary_cache(&summary_cache_path);
+
+    if sync_cache.is_empty() {
+        println!("No synced documents found. Run `baez sync` first.");
+        return Ok(());
+    }
+
+    // Collect docs to process
+    let to_process: Vec<(&String, &CacheEntry)> = sync_cache
+        .iter()
+        .filter(|(doc_id, _)| force || !summary_cache.contains_key(*doc_id))
+        .collect();
+
+    if to_process.is_empty() {
+        println!("All {} documents already summarized.", sync_cache.len());
+        return Ok(());
+    }
+
+    println!(
+        "{} documents to summarize ({} already done, {} total)",
+        to_process.len(),
+        sync_cache.len() - to_process.len(),
+        sync_cache.len(),
+    );
+
+    if dry_run {
+        println!("Dry run — no files will be written");
+    }
+
+    let pb = ProgressBar::new(to_process.len() as u64);
+    pb.set_style(
+        ProgressStyle::default_bar()
+            .template("[{bar:40}] {pos}/{len} docs")
+            .unwrap()
+            .progress_chars("##-"),
+    );
+
+    let mut summarized = 0u32;
+    let mut skipped_stubs = 0u32;
+    let mut skipped_missing = 0u32;
+
+    for (doc_id, cache_entry) in &to_process {
+        let transcript_path = paths
+            .raw_dir
+            .join(format!("{}_transcript.json", cache_entry.filename));
+        let metadata_path = paths
+            .raw_dir
+            .join(format!("{}_metadata.json", cache_entry.filename));
+
+        if !transcript_path.exists() || !metadata_path.exists() {
+            eprintln!(
+                "Warning: Raw files missing for {} ({}), skipping",
+                doc_id, cache_entry.filename
+            );
+            skipped_missing += 1;
+            pb.inc(1);
+            continue;
+        }
+
+        let transcript = match std::fs::read_to_string(&transcript_path)
+            .ok()
+            .and_then(|s| serde_json::from_str::<crate::model::RawTranscript>(&s).ok())
+        {
+            Some(t) => t,
+            None => {
+                eprintln!(
+                    "Warning: Could not parse transcript for {}, skipping",
+                    doc_id
+                );
+                skipped_missing += 1;
+                pb.inc(1);
+                continue;
+            }
+        };
+
+        let meta = match std::fs::read_to_string(&metadata_path)
+            .ok()
+            .and_then(|s| serde_json::from_str::<crate::model::DocumentMetadata>(&s).ok())
+        {
+            Some(m) => m,
+            None => {
+                eprintln!("Warning: Could not parse metadata for {}, skipping", doc_id);
+                skipped_missing += 1;
+                pb.inc(1);
+                continue;
+            }
+        };
+
+        // Check word count
+        let word_count = crate::util::count_transcript_words(&transcript);
+        if word_count < 20 {
+            skipped_stubs += 1;
+            pb.inc(1);
+            continue;
+        }
+
+        let slug = crate::util::doc_slug(meta.title.as_deref(), doc_id);
+
+        let attendee_names: Vec<String> = if let Some(ref rich) = meta.attendees {
+            rich.iter().filter_map(|a| a.name.clone()).collect()
+        } else {
+            meta.participants.clone()
+        };
+
+        if dry_run {
+            let title = meta.title.as_deref().unwrap_or("(untitled)");
+            let date = meta.created_at.format("%Y-%m-%d");
+            println!("  would summarize: {} — {}", date, title);
+            pb.inc(1);
+            continue;
+        }
+
+        let mut ctx = SummarizationContext {
+            config: &config,
+            api_key: &api_key,
+            client: &claude_client,
+            context_preamble: &mut context_preamble,
+            paths,
+            people_index: &mut people_index,
+            summary_cache: &mut summary_cache,
+            summary_cache_path: &summary_cache_path,
+            dry_run,
+        };
+
+        match summarize_and_reconcile(&mut ctx, doc_id, &transcript, &meta, &slug, &attendee_names)
+        {
+            Ok((Some(summary), entities)) => {
+                // Update existing markdown with summary
+                let doc_path = paths.doc_path(&meta.created_at, &slug);
+                if doc_path.exists() {
+                    if let Ok(content) = std::fs::read_to_string(&doc_path) {
+                        let updated =
+                            crate::summary::update_summary_in_markdown(&content, &summary);
+                        let _ = write_atomic(&doc_path, updated.as_bytes(), &paths.tmp_dir);
+
+                        // Merge related links
+                        if let Some(ref ent) = entities {
+                            let mut related = Vec::new();
+                            for p in &ent.people {
+                                related.push(format!("[[{}]]", p.name));
+                            }
+                            for c in &ent.concepts {
+                                related.push(format!("[[{}]]", c.name));
+                            }
+                            for p in &ent.projects {
+                                related.push(format!("[[{}]]", p.name));
+                            }
+                            let _ = crate::storage::merge_frontmatter_related(
+                                &doc_path,
+                                &related,
+                                &paths.tmp_dir,
+                            );
+                        }
+                    }
+                } else {
+                    eprintln!(
+                        "Warning: Markdown file not found at {}, summary not written (metadata created_at may differ from sync)",
+                        doc_path.display()
+                    );
+                }
+                summarized += 1;
+            }
+            Ok((None, _)) => {
+                // Summarization returned None (stub or failure handled inside)
+            }
+            Err(e) => {
+                eprintln!("Warning: Failed to summarize {}: {}", doc_id, e);
+            }
+        }
+
+        pb.inc(1);
+    }
+
+    let stats_msg = format!(
+        "summarized {} docs ({} stubs skipped, {} missing files skipped, {} already done)",
+        summarized,
+        skipped_stubs,
+        skipped_missing,
+        sync_cache.len() - to_process.len(),
+    );
+    pb.finish_with_message(stats_msg);
+
+    Ok(())
+}
+
 /// Fix file modification dates for all existing files to match meeting creation dates.
 /// Walks the date-based directory tree recursively.
 pub fn fix_dates(paths: &Paths) -> Result<()> {

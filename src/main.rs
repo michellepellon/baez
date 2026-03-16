@@ -167,6 +167,12 @@ fn run() -> Result<()> {
             println!("  Max input: {} characters", config.max_input_chars);
         }
         #[cfg(feature = "summaries")]
+        Some(baez::cli::Commands::SummarizeAll { force, dry_run }) => {
+            let paths = Paths::new(cli.vault)?;
+            paths.ensure_dirs()?;
+            baez::sync::summarize_all_docs(&paths, force, cli.verbose, dry_run)?;
+        }
+        #[cfg(feature = "summaries")]
         Some(baez::cli::Commands::Summarize { doc_id, save }) => {
             let paths = Paths::new(cli.vault)?;
 
