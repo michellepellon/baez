@@ -16,7 +16,7 @@ pub mod util;
 pub mod summary;
 
 pub use api::{ApiClient, ApiResponse};
-pub use auth::resolve_token;
+pub use auth::{resolve_credentials, resolve_token, Credentials, RefreshableState};
 pub use convert::{prosemirror_to_markdown, to_markdown, MarkdownOutput};
 pub use error::{Error, Result};
 pub use model::{
