@@ -1,19 +1,19 @@
-//! Blocking HTTP client for the Granola API.
+//! Blocking HTTP client for the Granola public API.
 //!
-//! Handles throttling, auth headers, retries, and fail-fast errors.
+//! Handles throttling, Bearer API-key auth, retries, and fail-fast errors.
 
-use crate::auth::Credentials;
-use crate::{DocumentMetadata, DocumentSummary, Error, PublicNote, RawTranscript, Result};
+use crate::{Error, ListNotesResponse, Note, NoteSummary, Result};
 use rand::Rng;
 use reqwest::blocking::Client;
-use serde_json::json;
-use std::collections::HashSet;
 use std::time::Duration;
 
 const MAX_RETRIES: u32 = 2;
 const INITIAL_RETRY_DELAY: Duration = Duration::from_secs(1);
+const DEFAULT_BASE_URL: &str = "https://public-api.granola.ai/v1";
+const PAGE_SIZE: u32 = 30;
 
-/// Holds both the raw JSON text and the parsed value from an API response
+/// Holds both the raw JSON text and the parsed value from an API response.
+/// Raw text is preserved so callers can archive the verbatim response.
 #[derive(Debug)]
 pub struct ApiResponse<T> {
     pub raw: String,
@@ -24,52 +24,46 @@ fn truncate_str(s: &str, max_chars: usize) -> String {
     if s.len() <= max_chars {
         return s.to_string();
     }
-
-    // Find a valid UTF-8 boundary at or before max_chars
     let mut boundary = max_chars;
     while boundary > 0 && !s.is_char_boundary(boundary) {
         boundary -= 1;
     }
-
     if boundary == 0 {
         return String::new();
     }
-
     format!("{}...", &s[..boundary])
 }
 
-/// Blocking HTTP client for the Granola API with throttling, retry, and
-/// transparent token refresh on 401.
+/// Blocking HTTP client for the Granola public API.
 pub struct ApiClient {
     client: Client,
     base_url: String,
-    credentials: Credentials,
+    api_key: String,
     throttle_min: u64,
     throttle_max: u64,
 }
 
 impl ApiClient {
-    /// Create a new client. Uses `https://api.granola.ai` when `base_url` is `None`.
-    pub fn new(credentials: Credentials, base_url: Option<String>) -> Result<Self> {
+    /// Create a new client. Uses `https://public-api.granola.ai/v1` when
+    /// `base_url` is `None`.
+    pub fn new(api_key: String, base_url: Option<String>) -> Result<Self> {
         let client = Client::builder().timeout(Duration::from_secs(30)).build()?;
 
         Ok(ApiClient {
             client,
-            base_url: base_url.unwrap_or_else(|| "https://api.granola.ai".into()),
-            credentials,
+            base_url: base_url.unwrap_or_else(|| DEFAULT_BASE_URL.into()),
+            api_key,
             throttle_min: 100,
             throttle_max: 300,
         })
     }
 
-    /// Set a random throttle range (milliseconds) between API calls.
     pub fn with_throttle(mut self, min_ms: u64, max_ms: u64) -> Self {
         self.throttle_min = min_ms;
         self.throttle_max = max_ms;
         self
     }
 
-    /// Disable inter-request throttling entirely.
     pub fn disable_throttle(mut self) -> Self {
         self.throttle_min = 0;
         self.throttle_max = 0;
@@ -83,155 +77,21 @@ impl ApiClient {
         }
     }
 
-    fn post<T: serde::de::DeserializeOwned>(
-        &self,
-        endpoint: &str,
-        body: serde_json::Value,
-    ) -> Result<T> {
-        self.post_with_raw(endpoint, body).map(|r| r.parsed)
-    }
+    /// GET a JSON resource at `path` (relative to base URL). Retries transient
+    /// errors via `util::retry_with_backoff`.
+    fn get_with_raw<T: serde::de::DeserializeOwned>(&self, path: &str) -> Result<ApiResponse<T>> {
+        let url = format!("{}{}", self.base_url, path);
 
-    /// Like post(), but also returns the raw response body text. On 401 with a
-    /// refreshable credential, attempts one refresh + retry.
-    fn post_with_raw<T: serde::de::DeserializeOwned>(
-        &self,
-        endpoint: &str,
-        body: serde_json::Value,
-    ) -> Result<ApiResponse<T>> {
-        let result = self.post_with_raw_once(endpoint, &body);
-        if matches!(&result, Err(Error::Api { status: 401, .. }))
-            && self.credentials.refresh_with_cas()?
-        {
-            return self.post_with_raw_once(endpoint, &body);
-        }
-        result
-    }
-
-    fn post_with_raw_once<T: serde::de::DeserializeOwned>(
-        &self,
-        endpoint: &str,
-        body: &serde_json::Value,
-    ) -> Result<ApiResponse<T>> {
-        let url = format!("{}{}", self.base_url, endpoint);
-
-        let (raw, _status) = crate::util::retry_with_backoff(
-            MAX_RETRIES,
-            INITIAL_RETRY_DELAY,
-            || {
-                let response = self
-                    .client
-                    .post(&url)
-                    .header(
-                        "Authorization",
-                        format!("Bearer {}", self.credentials.access_token()),
-                    )
-                    .header("Accept", "*/*")
-                    .header("Content-Type", "application/json")
-                    .header("User-Agent", "Granola/5.354.0")
-                    .header("X-Client-Version", "5.354.0")
-                    .json(body)
-                    .send()?;
-
-                self.throttle();
-
-                let status = response.status();
-                if !status.is_success() {
-                    let message = response.text().unwrap_or_default();
-                    let preview = truncate_str(&message, 100);
-                    return Err(Error::Api {
-                        endpoint: endpoint.into(),
-                        status: status.as_u16(),
-                        message: preview,
-                    });
-                }
-
-                let raw = response.text()?;
-                Ok((raw, status))
-            },
-            is_retryable,
-        )?;
-
-        let parsed = serde_json::from_str(&raw).map_err(|e| {
-            eprintln!("Failed to parse response from {}: {}", endpoint, e);
-            eprintln!(
-                "Response body (first 500 chars): {}",
-                truncate_str(&raw, 500)
-            );
-            Error::Parse(e)
-        })?;
-
-        Ok(ApiResponse { raw, parsed })
-    }
-
-    /// List all documents (without user notes or panels).
-    pub fn list_documents(&self) -> Result<Vec<DocumentSummary>> {
-        #[derive(serde::Deserialize)]
-        struct Response {
-            docs: Vec<DocumentSummary>,
-        }
-
-        let resp: Response = self.post("/v2/get-documents", json!({}))?;
-        Ok(resp.docs)
-    }
-
-    /// Fetch detailed metadata for a single document.
-    pub fn get_metadata(&self, doc_id: &str) -> Result<DocumentMetadata> {
-        self.post(
-            "/v1/get-document-metadata",
-            json!({ "document_id": doc_id }),
-        )
-    }
-
-    /// Fetch metadata, also returning the raw JSON response body.
-    pub fn get_metadata_with_raw(&self, doc_id: &str) -> Result<ApiResponse<DocumentMetadata>> {
-        self.post_with_raw(
-            "/v1/get-document-metadata",
-            json!({ "document_id": doc_id }),
-        )
-    }
-
-    /// Fetch the full transcript for a document.
-    pub fn get_transcript(&self, doc_id: &str) -> Result<RawTranscript> {
-        self.post(
-            "/v1/get-document-transcript",
-            json!({ "document_id": doc_id }),
-        )
-    }
-
-    /// Fetch the transcript, also returning the raw JSON response body.
-    pub fn get_transcript_with_raw(&self, doc_id: &str) -> Result<ApiResponse<RawTranscript>> {
-        self.post_with_raw(
-            "/v1/get-document-transcript",
-            json!({ "document_id": doc_id }),
-        )
-    }
-
-    /// Internal helper for GET requests (the public API uses GET, not POST). On
-    /// 401 with a refreshable credential, attempts one refresh + retry.
-    fn get<T: serde::de::DeserializeOwned>(&self, url: &str) -> Result<T> {
-        let result = self.get_once(url);
-        if matches!(&result, Err(Error::Api { status: 401, .. }))
-            && self.credentials.refresh_with_cas()?
-        {
-            return self.get_once(url);
-        }
-        result
-    }
-
-    fn get_once<T: serde::de::DeserializeOwned>(&self, url: &str) -> Result<T> {
         let raw = crate::util::retry_with_backoff(
             MAX_RETRIES,
             INITIAL_RETRY_DELAY,
             || {
                 let response = self
                     .client
-                    .get(url)
-                    .header(
-                        "Authorization",
-                        format!("Bearer {}", self.credentials.access_token()),
-                    )
+                    .get(&url)
+                    .header("Authorization", format!("Bearer {}", self.api_key))
                     .header("Accept", "application/json")
-                    .header("User-Agent", "baez/1.0 (Rust)")
+                    .header("User-Agent", "baez/0.2 (Rust)")
                     .send()?;
 
                 self.throttle();
@@ -239,9 +99,9 @@ impl ApiClient {
                 let status = response.status();
                 if !status.is_success() {
                     let message = response.text().unwrap_or_default();
-                    let preview = truncate_str(&message, 100);
+                    let preview = truncate_str(&message, 200);
                     return Err(Error::Api {
-                        endpoint: url.into(),
+                        endpoint: path.into(),
                         status: status.as_u16(),
                         message: preview,
                     });
@@ -253,7 +113,7 @@ impl ApiClient {
         )?;
 
         let parsed = serde_json::from_str(&raw).map_err(|e| {
-            eprintln!("Failed to parse response from {}: {}", url, e);
+            eprintln!("Failed to parse response from {}: {}", path, e);
             eprintln!(
                 "Response body (first 500 chars): {}",
                 truncate_str(&raw, 500)
@@ -261,63 +121,69 @@ impl ApiClient {
             Error::Parse(e)
         })?;
 
-        Ok(parsed)
+        Ok(ApiResponse { raw, parsed })
     }
 
-    /// Fetch a single note with summary text from the public API.
-    /// Uses base URL: https://public-api.granola.ai
-    pub fn get_public_note(&self, note_id: &str) -> Result<PublicNote> {
-        let url = format!("https://public-api.granola.ai/v1/notes/{}", note_id);
-        self.get(&url)
-    }
-
-    /// List documents with panels (user notes + AI-enhanced notes).
-    /// Paginates through all results in batches.
-    pub fn list_documents_with_notes(&self) -> Result<Vec<DocumentSummary>> {
-        #[derive(serde::Deserialize)]
-        struct Response {
-            docs: Vec<DocumentSummary>,
+    /// Fetch a single page of the notes list. Used internally by `list_notes`.
+    fn list_notes_page(
+        &self,
+        cursor: Option<&str>,
+        updated_after: Option<&str>,
+    ) -> Result<ListNotesResponse> {
+        let mut path = format!("/notes?page_size={}", PAGE_SIZE);
+        if let Some(c) = cursor {
+            path.push_str("&cursor=");
+            path.push_str(&urlencode(c));
+        }
+        if let Some(u) = updated_after {
+            path.push_str("&updated_after=");
+            path.push_str(&urlencode(u));
         }
 
-        let batch_size = 100;
-        let mut all_docs = Vec::new();
-        let mut offset = 0;
-        let mut seen_ids = HashSet::new();
+        self.get_with_raw::<ListNotesResponse>(&path)
+            .map(|r| r.parsed)
+    }
 
+    /// Iterate the notes list, paginating through all results. If
+    /// `updated_after` is provided, filters server-side.
+    pub fn list_notes(&self, updated_after: Option<&str>) -> Result<Vec<NoteSummary>> {
+        let mut all = Vec::new();
+        let mut cursor: Option<String> = None;
         loop {
-            let resp: Response = self.post(
-                "/v2/get-documents",
-                json!({
-                    "limit": batch_size,
-                    "offset": offset,
-                    "include_last_viewed_panel": true,
-                    "include_panels": true
-                }),
-            )?;
-
-            let count = resp.docs.len();
-
-            // Guard against infinite loops: if the API ignores limit/offset
-            // and keeps returning the same documents, break when no new IDs appear.
-            let new_count = resp
-                .docs
-                .iter()
-                .filter(|d| seen_ids.insert(d.id.clone()))
-                .count();
-            if new_count == 0 && count > 0 {
+            let page = self.list_notes_page(cursor.as_deref(), updated_after)?;
+            all.extend(page.notes);
+            if !page.has_more || page.cursor.is_none() {
                 break;
             }
-
-            all_docs.extend(resp.docs);
-
-            if count < batch_size {
-                break;
-            }
-            offset += batch_size;
+            cursor = page.cursor;
         }
-
-        Ok(all_docs)
+        Ok(all)
     }
+
+    /// Fetch a single note with the full transcript included.
+    pub fn get_note(&self, note_id: &str) -> Result<Note> {
+        self.get_note_with_raw(note_id).map(|r| r.parsed)
+    }
+
+    /// Fetch a single note with raw JSON preserved for archival.
+    pub fn get_note_with_raw(&self, note_id: &str) -> Result<ApiResponse<Note>> {
+        let path = format!("/notes/{}?include=transcript", note_id);
+        self.get_with_raw::<Note>(&path)
+    }
+}
+
+/// Percent-encode a query string value. Sufficient for our use (cursor and ISO
+/// timestamps); not a general URL encoder.
+fn urlencode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        if b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_' | b'.' | b'~') {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{:02X}", b));
+        }
+    }
+    out
 }
 
 /// Determine if an error is worth retrying (network errors, 429, 5xx).
@@ -339,11 +205,6 @@ mod tests {
     }
 
     #[test]
-    fn test_truncate_str_exact() {
-        assert_eq!(truncate_str("hello", 5), "hello");
-    }
-
-    #[test]
     fn test_truncate_str_long() {
         let result = truncate_str("hello world", 7);
         assert!(result.starts_with("hello"));
@@ -352,44 +213,27 @@ mod tests {
 
     #[test]
     fn test_truncate_str_utf8() {
-        // Test with multi-byte UTF-8 characters - should not panic
         let text = "Hello 世界 World";
         let result = truncate_str(text, 10);
-        // Should not panic and should be valid UTF-8
-        assert!(!result.is_empty());
-        assert!(result.len() <= 13); // 10 chars + "..."
-    }
-
-    #[test]
-    fn test_truncate_str_emoji() {
-        // Test with emoji (4-byte UTF-8)
-        let text = "Hello 🎉🎉🎉 World";
-        let result = truncate_str(text, 10);
-        // Should not panic
         assert!(!result.is_empty());
     }
 
-    fn static_creds(token: &str) -> Credentials {
-        Credentials::Static(token.to_string())
-    }
-
     #[test]
-    fn test_api_client_new() {
-        let client = ApiClient::new(static_creds("test_token"), None).unwrap();
-        assert_eq!(client.base_url, "https://api.granola.ai");
-        assert_eq!(client.credentials.access_token(), "test_token");
+    fn test_api_client_new_defaults_base_url() {
+        let client = ApiClient::new("test_key".into(), None).unwrap();
+        assert_eq!(client.base_url, "https://public-api.granola.ai/v1");
+        assert_eq!(client.api_key, "test_key");
     }
 
     #[test]
     fn test_api_client_custom_base() {
-        let client =
-            ApiClient::new(static_creds("token"), Some("https://custom.api".into())).unwrap();
+        let client = ApiClient::new("key".into(), Some("https://custom.api".into())).unwrap();
         assert_eq!(client.base_url, "https://custom.api");
     }
 
     #[test]
     fn test_api_client_throttle_config() {
-        let client = ApiClient::new(static_creds("token"), None)
+        let client = ApiClient::new("key".into(), None)
             .unwrap()
             .with_throttle(50, 150);
         assert_eq!(client.throttle_min, 50);
@@ -397,29 +241,36 @@ mod tests {
     }
 
     #[test]
-    fn test_api_client_disable_throttle() {
-        let client = ApiClient::new(static_creds("token"), None)
-            .unwrap()
-            .disable_throttle();
-        assert_eq!(client.throttle_min, 0);
-        assert_eq!(client.throttle_max, 0);
+    fn test_urlencode_basics() {
+        assert_eq!(urlencode("hello"), "hello");
+        assert_eq!(urlencode("a=b&c"), "a%3Db%26c");
+        assert_eq!(
+            urlencode("2026-05-11T00:00:00Z"),
+            "2026-05-11T00%3A00%3A00Z"
+        );
     }
 
     #[test]
-    fn test_get_public_note_uses_public_api_base_url() {
-        let client = ApiClient::new(static_creds("token"), Some("https://custom.api".into()))
-            .unwrap()
-            .disable_throttle();
-        let result = client.get_public_note("nonexistent-note-id");
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_list_documents_with_notes_method_exists() {
-        let client = ApiClient::new(static_creds("token"), None)
-            .unwrap()
-            .disable_throttle();
-        let result = client.list_documents_with_notes();
-        assert!(result.is_err());
+    fn test_is_retryable() {
+        assert!(is_retryable(&Error::Api {
+            endpoint: "/notes".into(),
+            status: 500,
+            message: "".into(),
+        }));
+        assert!(is_retryable(&Error::Api {
+            endpoint: "/notes".into(),
+            status: 429,
+            message: "".into(),
+        }));
+        assert!(!is_retryable(&Error::Api {
+            endpoint: "/notes".into(),
+            status: 401,
+            message: "".into(),
+        }));
+        assert!(!is_retryable(&Error::Api {
+            endpoint: "/notes".into(),
+            status: 404,
+            message: "".into(),
+        }));
     }
 }

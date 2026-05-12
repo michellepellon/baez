@@ -1,7 +1,9 @@
-//! Core sync logic for fetching and storing documents.
+//! Core sync logic for fetching and storing notes from the Granola public API.
 //!
 //! Handles incremental update detection, cache management, and progress reporting.
 
+#[cfg(feature = "summaries")]
+use crate::model::Note;
 use crate::{
     api::ApiClient,
     convert::to_markdown,
@@ -88,7 +90,7 @@ pub(crate) struct SummarizationContext<'a> {
     pub dry_run: bool,
 }
 
-/// Summarize a document and reconcile extracted entities.
+/// Summarize a note and reconcile extracted entities.
 ///
 /// Returns the summary text and extracted entities on success.
 /// Updates the summary cache after successful summarization.
@@ -96,17 +98,17 @@ pub(crate) struct SummarizationContext<'a> {
 pub(crate) fn summarize_and_reconcile(
     ctx: &mut SummarizationContext,
     doc_id: &str,
-    transcript: &crate::model::RawTranscript,
-    meta: &crate::model::DocumentMetadata,
+    note: &Note,
     slug: &str,
-    attendee_names: &[String],
 ) -> Result<(Option<String>, Option<crate::summary::ExtractedEntities>)> {
-    let word_count = crate::util::count_transcript_words(transcript);
+    let transcript_entries = note.transcript.as_deref().unwrap_or(&[]);
+    let word_count = crate::util::count_transcript_words(transcript_entries);
     if word_count < 20 {
         return Ok((None, None));
     }
 
-    let input = crate::summary::format_transcript_for_llm(transcript, meta);
+    let attendee_names = note.attendee_names();
+    let input = crate::summary::format_transcript_for_llm(note);
     let (summary_text, extracted_entities) = match crate::summary::summarize_transcript(
         &input,
         ctx.api_key,
@@ -127,12 +129,12 @@ pub(crate) fn summarize_and_reconcile(
     // Entity reconciliation
     if let Some(ref entities) = extracted_entities {
         if !ctx.dry_run {
-            let date = meta.created_at.format("%Y-%m-%d").to_string();
+            let date = note.created_at.format("%Y-%m-%d").to_string();
             let meeting_slug = format!("{}_{}", date, slug);
 
             // People
             for person in &entities.people {
-                let match_result = ctx.people_index.find_match(&person.name, attendee_names);
+                let match_result = ctx.people_index.find_match(&person.name, &attendee_names);
                 if let Some((canonical, existing_path)) = match_result {
                     let alias_refs: Vec<&str> = person.aliases.iter().map(|s| s.as_str()).collect();
                     if let Err(e) = crate::storage::enrich_person_note(
@@ -244,10 +246,10 @@ pub(crate) fn summarize_and_reconcile(
     Ok((summary_text, extracted_entities))
 }
 
-/// Sync all documents from the Granola API into the vault.
+/// Sync all notes from the Granola public API into the vault.
 ///
-/// Fetches the document list, compares against a local cache, and writes
-/// markdown + raw JSON for any new or updated documents.
+/// Fetches the notes list, compares against a local cache, and writes
+/// markdown + raw JSON for any new or updated notes.
 pub fn sync_all(
     client: &ApiClient,
     paths: &Paths,
@@ -320,16 +322,10 @@ pub fn sync_all(
     if force {
         println!("Force sync enabled — ignoring cache timestamps");
     }
-    println!("Fetching document list...");
-    let docs = client.list_documents_with_notes()?;
+    println!("Fetching note list...");
+    let notes = client.list_notes(None)?;
 
-    // Diagnostic: count notes availability
-    let with_user = docs.iter().filter(|d| d.user_notes().is_some()).count();
-    println!(
-        "Notes: {} with user notes (of {} total)",
-        with_user,
-        docs.len(),
-    );
+    println!("Notes: {} total", notes.len());
 
     // Load the sync cache
     let cache_path = paths.baez_dir.join(".sync_cache.json");
@@ -345,7 +341,7 @@ pub fn sync_all(
         HashMap::new()
     };
 
-    let pb = ProgressBar::new(docs.len() as u64);
+    let pb = ProgressBar::new(notes.len() as u64);
     pb.set_style(
         ProgressStyle::default_bar()
             .template("[{bar:40}] {pos}/{len} docs")
@@ -366,13 +362,12 @@ pub fn sync_all(
     #[cfg(feature = "summaries")]
     let mut summarize_only = 0u32;
 
-    for doc_summary in &docs {
+    for note_summary in &notes {
         // Check cache for quick timestamp comparison (--force bypasses cache)
         let should_update = if force {
             true
-        } else if let Some(cache_entry) = cache.get(&doc_summary.id) {
-            let remote_ts = doc_summary.updated_at.unwrap_or(doc_summary.created_at);
-            remote_ts > cache_entry.updated_at
+        } else if let Some(cache_entry) = cache.get(&note_summary.id) {
+            note_summary.updated_at > cache_entry.updated_at
         } else {
             true
         };
@@ -382,41 +377,26 @@ pub fn sync_all(
             #[cfg(feature = "summaries")]
             if !dry_run {
                 if let Some((ref config, ref key, ref claude_client)) = summarize_state {
-                    if !summary_cache.contains_key(&doc_summary.id) {
-                        // Try to load raw files from cache entry
-                        if let Some(cache_entry) = cache.get(&doc_summary.id) {
-                            let transcript_path = paths
+                    if !summary_cache.contains_key(&note_summary.id) {
+                        // Try to load the cached _note.json
+                        if let Some(cache_entry) = cache.get(&note_summary.id) {
+                            let note_path = paths
                                 .raw_dir
-                                .join(format!("{}_transcript.json", cache_entry.filename));
-                            let metadata_path = paths
-                                .raw_dir
-                                .join(format!("{}_metadata.json", cache_entry.filename));
+                                .join(format!("{}_note.json", cache_entry.filename));
 
-                            let raw_ok = (|| -> std::result::Result<
-                                (crate::model::RawTranscript, crate::model::DocumentMetadata),
-                                Box<dyn std::error::Error>,
-                            > {
-                                let t_str = std::fs::read_to_string(&transcript_path)?;
-                                let t: crate::model::RawTranscript = serde_json::from_str(&t_str)?;
-                                let m_str = std::fs::read_to_string(&metadata_path)?;
-                                let mut m: crate::model::DocumentMetadata =
-                                    serde_json::from_str(&m_str)?;
-                                m.created_at = doc_summary.created_at;
-                                Ok((t, m))
-                            })();
+                            let note_load: std::result::Result<Note, Box<dyn std::error::Error>> =
+                                (|| {
+                                    let s = std::fs::read_to_string(&note_path)?;
+                                    let n: Note = serde_json::from_str(&s)?;
+                                    Ok(n)
+                                })();
 
-                            match raw_ok {
-                                Ok((transcript, meta)) => {
+                            match note_load {
+                                Ok(note) => {
                                     let slug = crate::util::doc_slug(
-                                        meta.title.as_deref(),
-                                        &doc_summary.id,
+                                        note.title.as_deref(),
+                                        &note_summary.id,
                                     );
-                                    let attendee_names: Vec<String> =
-                                        if let Some(ref rich) = meta.attendees {
-                                            rich.iter().filter_map(|a| a.name.clone()).collect()
-                                        } else {
-                                            meta.participants.clone()
-                                        };
 
                                     let mut ctx = SummarizationContext {
                                         config,
@@ -432,15 +412,13 @@ pub fn sync_all(
 
                                     match summarize_and_reconcile(
                                         &mut ctx,
-                                        &doc_summary.id,
-                                        &transcript,
-                                        &meta,
+                                        &note_summary.id,
+                                        &note,
                                         &slug,
-                                        &attendee_names,
                                     ) {
                                         Ok((Some(summary_text), extracted_entities)) => {
                                             // Update the existing markdown file with summary
-                                            let doc_path = paths.doc_path(&meta.created_at, &slug);
+                                            let doc_path = paths.doc_path(&note.created_at, &slug);
                                             if doc_path.exists() {
                                                 match std::fs::read_to_string(&doc_path) {
                                                     Ok(existing_md) => {
@@ -510,15 +488,15 @@ pub fn sync_all(
                                         Err(e) => {
                                             eprintln!(
                                                 "Warning: Catch-up summarization failed for {}: {}",
-                                                doc_summary.id, e
+                                                note_summary.id, e
                                             );
                                         }
                                     }
                                 }
                                 Err(e) => {
                                     eprintln!(
-                                        "Warning: Cannot load raw files for catch-up summary of {}: {}",
-                                        doc_summary.id, e
+                                        "Warning: Cannot load cached note for catch-up summary of {}: {}",
+                                        note_summary.id, e
                                     );
                                 }
                             }
@@ -533,38 +511,33 @@ pub fn sync_all(
         }
 
         if dry_run {
-            let title = doc_summary.title.as_deref().unwrap_or("(untitled)");
-            let date = doc_summary.created_at.format("%Y-%m-%d");
+            let title = note_summary.title.as_deref().unwrap_or("(untitled)");
+            let date = note_summary.created_at.format("%Y-%m-%d");
             println!("  would sync: {} — {}", date, title);
             synced += 1;
             pb.inc(1);
             continue;
         }
 
-        // Fetch metadata and transcript from API, keeping raw responses
-        let meta_resp = client.get_metadata_with_raw(&doc_summary.id)?;
-        let transcript_resp = client.get_transcript_with_raw(&doc_summary.id)?;
-        let mut meta = meta_resp.parsed;
-        let transcript = transcript_resp.parsed;
+        // Fetch the full note (metadata + transcript in one call), keeping raw response.
+        let note_resp = client.get_note_with_raw(&note_summary.id)?;
+        let mut note = note_resp.parsed;
+
+        // The list endpoint always provides created_at; some response shapes may
+        // omit it on the detail endpoint. Prefer the list-summary value to be safe.
+        note.created_at = note_summary.created_at;
 
         // Triage: check if transcript has enough content
-        let word_count = count_transcript_words(&transcript);
+        let transcript_entries = note.transcript.as_deref().unwrap_or(&[]);
+        let word_count = count_transcript_words(transcript_entries);
         let status = if word_count < 20 {
             "stub"
         } else {
             "substantive"
         };
 
-        // The metadata endpoint sometimes omits created_at; prefer the
-        // summary's value which the list endpoint always provides.
-        meta.created_at = doc_summary.created_at;
-
-        // Extract user notes from panels (my_notes -> notes field -> last_viewed_panel fallback)
-        let notes_md = doc_summary
-            .user_notes()
-            .as_ref()
-            .map(crate::convert::prosemirror_to_markdown)
-            .filter(|s| !s.is_empty());
+        // Compute slug from the (possibly refreshed) note
+        let slug = crate::util::doc_slug(note.title.as_deref(), &note_summary.id);
 
         // AI summarization + entity extraction (only for substantive transcripts)
         #[cfg(feature = "summaries")]
@@ -573,14 +546,6 @@ pub fn sync_all(
             Option<crate::summary::ExtractedEntities>,
         ) = if status == "substantive" {
             if let Some((ref config, ref key, ref claude_client)) = summarize_state {
-                let slug_for_summary =
-                    crate::util::doc_slug(meta.title.as_deref(), &doc_summary.id);
-                let attendee_names: Vec<String> = if let Some(ref rich) = meta.attendees {
-                    rich.iter().filter_map(|a| a.name.clone()).collect()
-                } else {
-                    meta.participants.clone()
-                };
-
                 let mut ctx = SummarizationContext {
                     config,
                     api_key: key,
@@ -593,14 +558,7 @@ pub fn sync_all(
                     dry_run,
                 };
 
-                match summarize_and_reconcile(
-                    &mut ctx,
-                    &doc_summary.id,
-                    &transcript,
-                    &meta,
-                    &slug_for_summary,
-                    &attendee_names,
-                ) {
+                match summarize_and_reconcile(&mut ctx, &note_summary.id, &note, &slug) {
                     Ok((summary, entities)) => {
                         if summary.is_some() {
                             summarized += 1;
@@ -613,7 +571,7 @@ pub fn sync_all(
                         (summary, entities)
                     }
                     Err(e) => {
-                        eprintln!("Warning: Failed to summarize {}: {}", doc_summary.id, e);
+                        eprintln!("Warning: Failed to summarize {}: {}", note_summary.id, e);
                         (None, None)
                     }
                 }
@@ -651,34 +609,24 @@ pub fn sync_all(
         let related: Vec<String> = vec![];
 
         // Convert to markdown
-        let md = to_markdown(
-            &transcript,
-            &meta,
-            &doc_summary.id,
-            notes_md.as_deref(),
-            summary_text.as_deref(),
-            related,
-            Some(status),
-        )?;
+        let md = to_markdown(&note, summary_text.as_deref(), related, Some(status))?;
 
         let full_md = format!("---\n{}---\n\n{}", md.frontmatter_yaml, md.body);
 
-        // Compute filename and date-based path
-        let slug = crate::util::doc_slug(meta.title.as_deref(), &doc_summary.id);
-        let doc_path = paths.doc_path(&meta.created_at, &slug);
-        let date = meta.created_at.format("%Y-%m-%d").to_string();
+        // Compute date-based path
+        let doc_path = paths.doc_path(&note.created_at, &slug);
+        let date = note.created_at.format("%Y-%m-%d").to_string();
         let base_filename = format!("{}_{}", date, slug);
 
         // If filename changed in cache, remove old files
-        if let Some(old_entry) = cache.get(&doc_summary.id) {
+        if let Some(old_entry) = cache.get(&note_summary.id) {
             if old_entry.filename != base_filename {
-                // Old files could be in flat transcripts_dir or date-based paths
                 let old_path = paths.granola_dir.join(format!("{}.md", old_entry.filename));
                 if old_path.exists() {
                     std::fs::remove_file(&old_path)?;
                 }
-                // Clean up all raw file variants
-                for suffix in &["", "_transcript", "_metadata"] {
+                // Clean up all raw file variants (legacy + new)
+                for suffix in &["", "_transcript", "_metadata", "_note"] {
                     let old_json = paths
                         .raw_dir
                         .join(format!("{}{}.json", old_entry.filename, suffix));
@@ -689,46 +637,32 @@ pub fn sync_all(
             }
         }
 
-        // Write files: save verbatim API responses as raw JSON
-        let transcript_json_path = paths
-            .raw_dir
-            .join(format!("{}_transcript.json", base_filename));
-        let metadata_json_path = paths
-            .raw_dir
-            .join(format!("{}_metadata.json", base_filename));
+        // Write files: save verbatim API response as raw JSON, plus markdown
+        let note_json_path = paths.raw_dir.join(format!("{}_note.json", base_filename));
 
-        write_atomic(
-            &transcript_json_path,
-            transcript_resp.raw.as_bytes(),
-            &paths.tmp_dir,
-        )?;
-        write_atomic(
-            &metadata_json_path,
-            meta_resp.raw.as_bytes(),
-            &paths.tmp_dir,
-        )?;
+        write_atomic(&note_json_path, note_resp.raw.as_bytes(), &paths.tmp_dir)?;
         write_atomic(&doc_path, full_md.as_bytes(), &paths.tmp_dir)?;
 
-        // Remove legacy single .json file if it exists
-        let legacy_json = paths.raw_dir.join(format!("{}.json", base_filename));
-        if legacy_json.exists() {
-            std::fs::remove_file(&legacy_json)?;
+        // Remove legacy raw files (transcript/metadata split, or unsuffixed) if they exist
+        for suffix in &["", "_transcript", "_metadata"] {
+            let legacy = paths
+                .raw_dir
+                .join(format!("{}{}.json", base_filename, suffix));
+            if legacy.exists() {
+                let _ = std::fs::remove_file(&legacy);
+            }
         }
 
         // Set file modification time to meeting creation date
-        set_file_time(&transcript_json_path, &meta.created_at)?;
-        set_file_time(&metadata_json_path, &meta.created_at)?;
-        set_file_time(&doc_path, &meta.created_at)?;
+        set_file_time(&note_json_path, &note.created_at)?;
+        set_file_time(&doc_path, &note.created_at)?;
 
-        // Update cache - CRITICAL: store the same timestamp we compare against
-        // (doc_summary.updated_at, NOT meta.updated_at - they can differ!)
-        let stored_ts = doc_summary.updated_at.unwrap_or(doc_summary.created_at);
-
+        // Update cache - store the same timestamp we compare against on the next run.
         cache.insert(
-            doc_summary.id.clone(),
+            note_summary.id.clone(),
             CacheEntry {
                 filename: base_filename.clone(),
-                updated_at: stored_ts,
+                updated_at: note_summary.updated_at,
             },
         );
         save_cache(&cache_path, &cache, &paths.tmp_dir)?;
@@ -740,7 +674,7 @@ pub fn sync_all(
     #[cfg(feature = "summaries")]
     let stats_msg = format!(
         "synced {} docs ({} new/updated, {} skipped, {} summarized, {} catch-up summarized, {} people, {} concepts, {} projects)",
-        docs.len(),
+        notes.len(),
         synced,
         skipped,
         summarized,
@@ -752,7 +686,7 @@ pub fn sync_all(
     #[cfg(not(feature = "summaries"))]
     let stats_msg = format!(
         "synced {} docs ({} new/updated, {} skipped)",
-        docs.len(),
+        notes.len(),
         synced,
         skipped
     );
@@ -761,10 +695,10 @@ pub fn sync_all(
     Ok(())
 }
 
-/// Batch-summarize all synced documents that haven't been summarized yet.
+/// Batch-summarize all synced notes that haven't been summarized yet.
 ///
-/// Reads transcripts from local raw JSON files — does NOT hit the Granola API.
-/// Uses the sync cache as the inventory of known documents.
+/// Reads notes from local raw JSON files (`<base>_note.json`) — does NOT hit
+/// the Granola API. Uses the sync cache as the inventory of known notes.
 #[cfg(feature = "summaries")]
 pub fn summarize_all_docs(paths: &Paths, force: bool, verbose: bool, dry_run: bool) -> Result<()> {
     use indicatif::{ProgressBar, ProgressStyle};
@@ -799,12 +733,12 @@ pub fn summarize_all_docs(paths: &Paths, force: bool, verbose: bool, dry_run: bo
     let mut summary_cache = load_summary_cache(&summary_cache_path);
 
     if sync_cache.is_empty() {
-        println!("No synced documents found. Run `baez sync` first.");
+        println!("No synced notes found. Run `baez sync` first.");
         return Ok(());
     }
 
     // Pre-populate summary cache: scan existing markdown files for ## Summary sections.
-    // This handles docs that were summarized before the summary cache existed.
+    // This handles notes that were summarized before the summary cache existed.
     if summary_cache.is_empty() && !force {
         let mut backfilled = 0u32;
         for (doc_id, cache_entry) in &sync_cache {
@@ -845,19 +779,19 @@ pub fn summarize_all_docs(paths: &Paths, force: bool, verbose: bool, dry_run: bo
         }
     }
 
-    // Collect docs to process
+    // Collect notes to process
     let to_process: Vec<(&String, &CacheEntry)> = sync_cache
         .iter()
         .filter(|(doc_id, _)| force || !summary_cache.contains_key(*doc_id))
         .collect();
 
     if to_process.is_empty() {
-        println!("All {} documents already summarized.", sync_cache.len());
+        println!("All {} notes already summarized.", sync_cache.len());
         return Ok(());
     }
 
     println!(
-        "{} documents to summarize ({} already done, {} total)",
+        "{} notes to summarize ({} already done, {} total)",
         to_process.len(),
         sync_cache.len() - to_process.len(),
         sync_cache.len(),
@@ -880,16 +814,13 @@ pub fn summarize_all_docs(paths: &Paths, force: bool, verbose: bool, dry_run: bo
     let mut skipped_missing = 0u32;
 
     for (doc_id, cache_entry) in &to_process {
-        let transcript_path = paths
+        let note_path = paths
             .raw_dir
-            .join(format!("{}_transcript.json", cache_entry.filename));
-        let metadata_path = paths
-            .raw_dir
-            .join(format!("{}_metadata.json", cache_entry.filename));
+            .join(format!("{}_note.json", cache_entry.filename));
 
-        if !transcript_path.exists() || !metadata_path.exists() {
+        if !note_path.exists() {
             eprintln!(
-                "Warning: Raw files missing for {} ({}), skipping",
+                "Warning: Note file missing for {} ({}), skipping",
                 doc_id, cache_entry.filename
             );
             skipped_missing += 1;
@@ -897,29 +828,13 @@ pub fn summarize_all_docs(paths: &Paths, force: bool, verbose: bool, dry_run: bo
             continue;
         }
 
-        let transcript = match std::fs::read_to_string(&transcript_path)
+        let mut note = match std::fs::read_to_string(&note_path)
             .ok()
-            .and_then(|s| serde_json::from_str::<crate::model::RawTranscript>(&s).ok())
+            .and_then(|s| serde_json::from_str::<Note>(&s).ok())
         {
-            Some(t) => t,
+            Some(n) => n,
             None => {
-                eprintln!(
-                    "Warning: Could not parse transcript for {}, skipping",
-                    doc_id
-                );
-                skipped_missing += 1;
-                pb.inc(1);
-                continue;
-            }
-        };
-
-        let mut meta = match std::fs::read_to_string(&metadata_path)
-            .ok()
-            .and_then(|s| serde_json::from_str::<crate::model::DocumentMetadata>(&s).ok())
-        {
-            Some(m) => m,
-            None => {
-                eprintln!("Warning: Could not parse metadata for {}, skipping", doc_id);
+                eprintln!("Warning: Could not parse note for {}, skipping", doc_id);
                 skipped_missing += 1;
                 pb.inc(1);
                 continue;
@@ -927,36 +842,29 @@ pub fn summarize_all_docs(paths: &Paths, force: bool, verbose: bool, dry_run: bo
         };
 
         // Override created_at from the sync cache filename (YYYY-MM-DD_slug format)
-        // because the metadata JSON's created_at can default to Utc::now() when the
-        // API omitted it. The sync loop fixes this from doc_summary.created_at, but
-        // we only have the raw JSON here.
+        // to match the on-disk markdown path produced by sync.
         if let Some(date_str) = cache_entry.filename.get(..10) {
             if let Ok(parsed) = chrono::NaiveDate::parse_from_str(date_str, "%Y-%m-%d") {
                 if let Some(dt) = parsed.and_hms_opt(0, 0, 0) {
-                    meta.created_at = DateTime::<Utc>::from_naive_utc_and_offset(dt, Utc);
+                    note.created_at = DateTime::<Utc>::from_naive_utc_and_offset(dt, Utc);
                 }
             }
         }
 
         // Check word count
-        let word_count = crate::util::count_transcript_words(&transcript);
+        let transcript_entries = note.transcript.as_deref().unwrap_or(&[]);
+        let word_count = crate::util::count_transcript_words(transcript_entries);
         if word_count < 20 {
             skipped_stubs += 1;
             pb.inc(1);
             continue;
         }
 
-        let slug = crate::util::doc_slug(meta.title.as_deref(), doc_id);
-
-        let attendee_names: Vec<String> = if let Some(ref rich) = meta.attendees {
-            rich.iter().filter_map(|a| a.name.clone()).collect()
-        } else {
-            meta.participants.clone()
-        };
+        let slug = crate::util::doc_slug(note.title.as_deref(), doc_id);
 
         if dry_run {
-            let title = meta.title.as_deref().unwrap_or("(untitled)");
-            let date = meta.created_at.format("%Y-%m-%d");
+            let title = note.title.as_deref().unwrap_or("(untitled)");
+            let date = note.created_at.format("%Y-%m-%d");
             println!("  would summarize: {} — {}", date, title);
             pb.inc(1);
             continue;
@@ -974,11 +882,10 @@ pub fn summarize_all_docs(paths: &Paths, force: bool, verbose: bool, dry_run: bo
             dry_run,
         };
 
-        match summarize_and_reconcile(&mut ctx, doc_id, &transcript, &meta, &slug, &attendee_names)
-        {
+        match summarize_and_reconcile(&mut ctx, doc_id, &note, &slug) {
             Ok((Some(summary), entities)) => {
                 // Update existing markdown with summary
-                let doc_path = paths.doc_path(&meta.created_at, &slug);
+                let doc_path = paths.doc_path(&note.created_at, &slug);
                 if doc_path.exists() {
                     if let Ok(content) = std::fs::read_to_string(&doc_path) {
                         let updated =
@@ -1006,7 +913,7 @@ pub fn summarize_all_docs(paths: &Paths, force: bool, verbose: bool, dry_run: bo
                     }
                 } else {
                     eprintln!(
-                        "Warning: Markdown file not found at {}, summary not written (metadata created_at may differ from sync)",
+                        "Warning: Markdown file not found at {}, summary not written (note created_at may differ from sync)",
                         doc_path.display()
                     );
                 }
@@ -1055,14 +962,14 @@ pub fn fix_dates(paths: &Paths) -> Result<()> {
         };
 
         // Set the file time
-        match set_file_time(&path, &frontmatter.created_at()) {
+        match set_file_time(&path, &frontmatter.created) {
             Ok(_) => {
-                // Also fix corresponding JSON files if they exist
+                // Also fix corresponding JSON files if they exist (new + legacy formats)
                 let filename = path.file_stem().unwrap().to_str().unwrap();
-                for suffix in &["_transcript", "_metadata", ""] {
+                for suffix in &["_note", "_transcript", "_metadata", ""] {
                     let json_path = paths.raw_dir.join(format!("{}{}.json", filename, suffix));
                     if json_path.exists() {
-                        if let Err(e) = set_file_time(&json_path, &frontmatter.created_at()) {
+                        if let Err(e) = set_file_time(&json_path, &frontmatter.created) {
                             eprintln!(
                                 "Warning: Failed to set time for {}: {}",
                                 json_path.display(),
@@ -1182,5 +1089,31 @@ mod tests {
             "baez_dir should exist at {}",
             paths.baez_dir.display()
         );
+    }
+
+    #[test]
+    fn test_cache_entry_roundtrip() {
+        use super::{load_cache, save_cache, CacheEntry};
+        use chrono::Utc;
+        use std::collections::HashMap;
+
+        let temp = TempDir::new().unwrap();
+        let cache_path = temp.path().join(".sync_cache.json");
+        let tmp_dir = temp.path().join("tmp");
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+
+        let mut cache = HashMap::new();
+        cache.insert(
+            "not_xyz".to_string(),
+            CacheEntry {
+                filename: "2026-05-11_test".into(),
+                updated_at: Utc::now(),
+            },
+        );
+
+        save_cache(&cache_path, &cache, &tmp_dir).unwrap();
+        let loaded = load_cache(&cache_path);
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded["not_xyz"].filename, "2026-05-11_test");
     }
 }

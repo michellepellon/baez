@@ -16,13 +16,12 @@ pub mod util;
 pub mod summary;
 
 pub use api::{ApiClient, ApiResponse};
-pub use auth::{resolve_credentials, resolve_token, Credentials, RefreshableState};
-pub use convert::{prosemirror_to_markdown, to_markdown, MarkdownOutput};
+pub use auth::{resolve_api_key, set_api_key_in_keychain};
+pub use convert::{to_markdown, MarkdownOutput};
 pub use error::{Error, Result};
 pub use model::{
-    Attendee, CompanyInfo, DocumentMetadata, DocumentSummary, Employment, Frontmatter, LinkedIn,
-    PersonDetails, PersonInfo, PersonName, ProseMirrorDoc, ProseMirrorMark, ProseMirrorNode,
-    PublicNote, RawTranscript,
+    CalendarEvent, Folder, Frontmatter, ListNotesResponse, Note, NoteSummary, Speaker,
+    TranscriptEntry, User,
 };
 pub use storage::{
     create_concept_note, create_person_note, create_project_note, enrich_concept_note,

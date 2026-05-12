@@ -229,43 +229,6 @@ pub fn write_atomic(path: &Path, content: &[u8], tmp_dir: &Path) -> Result<()> {
     Ok(())
 }
 
-/// Write `content` to `path` atomically while preserving the existing file's mode.
-///
-/// If the file doesn't exist, falls back to `0o600`. Used for files owned by other
-/// applications (e.g. Granola's `supabase.json`) where we should not change the
-/// permissions Granola chose.
-pub fn write_atomic_preserve_mode(path: &Path, content: &[u8], tmp_dir: &Path) -> Result<()> {
-    use rand::Rng;
-
-    // Capture existing mode before we touch anything. None if file doesn't exist.
-    #[cfg(unix)]
-    let target_mode = {
-        use std::os::unix::fs::PermissionsExt;
-        fs::metadata(path)
-            .map(|m| m.permissions().mode() & 0o777)
-            .ok()
-    };
-
-    let random: u32 = rand::thread_rng().gen();
-    let tmp_path = tmp_dir.join(format!("{:x}.part", random));
-
-    fs::write(&tmp_path, content)?;
-
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let mode = target_mode.unwrap_or(0o600);
-        fs::set_permissions(&tmp_path, fs::Permissions::from_mode(mode))?;
-    }
-
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    fs::rename(&tmp_path, path)?;
-
-    Ok(())
-}
-
 /// Set file modification time to match a given datetime
 pub fn set_file_time(path: &Path, datetime: &DateTime<Utc>) -> Result<()> {
     let timestamp = datetime.timestamp();
@@ -988,49 +951,6 @@ mod write_tests {
 
         let perms = fs::metadata(&target).unwrap().permissions();
         assert_eq!(perms.mode() & 0o777, 0o600);
-    }
-
-    #[test]
-    #[cfg(unix)]
-    fn test_write_atomic_preserve_mode_keeps_existing_mode() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let temp = TempDir::new().unwrap();
-        let paths = Paths::new(Some(temp.path().to_path_buf())).unwrap();
-        paths.ensure_dirs().unwrap();
-
-        let target = temp.path().join("session.json");
-        fs::write(&target, b"original").unwrap();
-        fs::set_permissions(&target, fs::Permissions::from_mode(0o644)).unwrap();
-
-        write_atomic_preserve_mode(&target, b"updated", &paths.tmp_dir).unwrap();
-
-        assert_eq!(fs::read_to_string(&target).unwrap(), "updated");
-        let mode = fs::metadata(&target).unwrap().permissions().mode() & 0o777;
-        assert_eq!(
-            mode, 0o644,
-            "expected preserved mode 0o644, got 0o{:o}",
-            mode
-        );
-    }
-
-    #[test]
-    #[cfg(unix)]
-    fn test_write_atomic_preserve_mode_new_file_defaults_to_0600() {
-        use std::os::unix::fs::PermissionsExt;
-
-        let temp = TempDir::new().unwrap();
-        let paths = Paths::new(Some(temp.path().to_path_buf())).unwrap();
-        paths.ensure_dirs().unwrap();
-
-        let target = temp.path().join("new.json");
-        assert!(!target.exists());
-
-        write_atomic_preserve_mode(&target, b"created", &paths.tmp_dir).unwrap();
-
-        assert_eq!(fs::read_to_string(&target).unwrap(), "created");
-        let mode = fs::metadata(&target).unwrap().permissions().mode() & 0o777;
-        assert_eq!(mode, 0o600, "expected default mode 0o600, got 0o{:o}", mode);
     }
 }
 
