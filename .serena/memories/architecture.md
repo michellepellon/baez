@@ -9,18 +9,18 @@
 
 ```
 src/
-├── main.rs      — CLI entrypoint, command dispatch, watch loop (planned)
+├── main.rs      — CLI entrypoint, command dispatch
 ├── lib.rs       — Module re-exports (public API surface)
 ├── cli.rs       — clap definitions: Cli struct, Commands enum, flag parsers
 ├── model.rs     — Serde data models for Granola API + Obsidian frontmatter
 ├── api.rs       — ApiClient: blocking HTTP client for Granola API
 ├── auth.rs      — Token resolution chain (CLI → env → config → session file)
-├── sync.rs      — Core sync_all() orchestration + fix_dates()
-├── storage.rs   — Vault paths, atomic writes, config file, frontmatter parsing
+├── sync.rs      — sync_all() + summarize_all_docs(), caches, SummarizationContext, summarize_and_reconcile
+├── storage.rs   — Vault paths, atomic writes, config file, frontmatter parsing, PeopleIndex, entity note CRUD
 ├── convert.rs   — Transcript → Obsidian markdown conversion, ProseMirror → markdown
-├── summary.rs   — Claude API summarization (feature-gated behind "summaries")
+├── summary.rs   — Claude API summarization + ExtractedEntities parsing (feature-gated)
 ├── error.rs     — Error enum with thiserror, exit codes
-└── util.rs      — slugify, timestamp normalization, retry_with_backoff
+└── util.rs      — slugify, doc_slug, count_transcript_words, normalize_timestamp, retry_with_backoff, levenshtein_distance
 ```
 
 ## Data Flow
@@ -29,18 +29,24 @@ src/
 2. **API Client:** `ApiClient` in `api.rs` uses blocking reqwest with Bearer token auth. Mimics Granola desktop app headers (`User-Agent: Granola/5.354.0`). Random throttle (100-300ms) between requests.
 3. **Sync loop** (`sync_all()` in `sync.rs`):
    - `client.list_documents_with_notes()` — paginated fetch of all docs with notes/panels
-   - For each doc: compare `updated_at` against cache → skip if unchanged
-   - Fetch metadata + transcript via separate API calls (keeping raw JSON)
+   - Loads both `.sync_cache.json` (timestamp-based skip) and `.summary_cache.json` (summarization-done skip)
+   - For each doc: compare `updated_at` against sync cache → if unchanged, take **summarize-only path** if summary cache lacks entry and raw files exist locally
+   - Otherwise: fetch metadata + transcript via API (keeping raw JSON)
+   - Triage: `count_transcript_words(&transcript)` < 20 → `status = "stub"` (skip summary), else `"substantive"`
    - Extract user notes from ProseMirror `notes` field (with `last_viewed_panel.content` fallback)
-   - Optionally summarize via Claude API
-   - `to_markdown()` converts to Obsidian-flavored markdown with frontmatter
+   - If substantive + key available: `summarize_and_reconcile()` summarizes via Claude, parses entity JSON block, creates/enriches entity notes, updates summary cache
+   - `to_markdown()` converts to Obsidian-flavored markdown with frontmatter (incl. `related` list of `[[wiki-links]]` to entities, `status` field)
    - `write_atomic()` writes files via temp+rename with 0o600 permissions
    - `set_file_time()` sets mtime to meeting creation date
    - Update sync cache atomically
-4. **Output:** Markdown files in `Vault/Granola/YYYY/MM/`, raw JSON in `.baez/raw/`
+4. **Batch summarization** (`summarize_all_docs()` in `sync.rs`):
+   - Reads only from local raw JSON + sync cache — **never hits the Granola API**
+   - Backfills `.summary_cache.json` by scanning existing markdown for `## Summary` if cache is empty
+   - For each unsummarized doc: parse local raw files → `summarize_and_reconcile()` → update existing markdown's `## Summary` section + `related` frontmatter
+5. **Output:** Markdown files in `Vault/Granola/YYYY/MM/`, raw JSON in `.baez/raw/`, entity notes in `Vault/People|Concepts|Projects/`
 
 ## Key APIs Used
-- **Granola internal API** (`api.granola.ai`): 
+- **Granola internal API** (`api.granola.ai`):
   - `POST /v2/get-documents` (list, with pagination + panels)
   - `POST /v1/get-document-metadata`
   - `POST /v1/get-document-transcript`
@@ -55,7 +61,25 @@ src/
 - **macOS Keychain**: via `keyring` crate (Anthropic API key storage)
 - **Config file**: `~/.config/baez/config.json` (JSON, XDG_CONFIG_HOME respected)
 
+## Vault Layout
+```
+Vault/
+├── People/                 — Entity notes (auto-created when summarization runs)
+├── Concepts/
+├── Projects/
+└── Granola/
+    ├── YYYY/MM/YYYY-MM-DD_slug.md
+    └── .baez/
+        ├── raw/                 (transcript + metadata JSON)
+        ├── summaries/           (legacy summary files dir)
+        ├── tmp/                 (atomic write temp dir)
+        ├── summary_config.json
+        ├── .sync_cache.json     (incremental sync state)
+        └── .summary_cache.json  (summarization progress)
+```
+Note: `People/`, `Concepts/`, `Projects/` are at the **vault root**, not under `Granola/` — they are first-class Obsidian notes the user navigates directly.
+
 ## Configuration
-- `SummaryConfig` in `summary.rs`: model (default: claude-opus-4-6), max_input_chars (600K), max_tokens (4096), custom_prompt, temperature
+- `SummaryConfig` in `summary.rs`: model (default: `claude-opus-4-6`), max_input_chars (600K), max_tokens (8192), custom_prompt, temperature
 - Stored at `.baez/summary_config.json` in vault
 - `Paths` in `storage.rs`: vault_dir, granola_dir, baez_dir, raw_dir, summaries_dir, tmp_dir

@@ -18,12 +18,20 @@
 
 ## Install & Run
 - `cargo install --path .` or `just install` — Install to ~/.cargo/bin
-- `baez sync --vault /path/to/vault` — Sync transcripts
-- `baez sync --force` — Force re-sync all
+- `baez sync --vault /path/to/vault` — Sync transcripts (also runs summarization + entity extraction by default)
+- `baez sync --force` — Force re-sync all (ignores both caches)
+- `baez sync --no-summarize` — Sync without AI summaries or entity extraction
 - `baez sync --dry-run` — Preview sync without writing
 - `baez list` — List all documents
 - `baez fetch <doc-id>` — Fetch a single document
-- `baez summarize <doc-id> --save` — Summarize and save to file
+- `baez summarize <doc-id> --save` — Summarize a single doc and save to file
+- `baez summarize-all` — Batch-summarize all synced docs that lack summaries (reads local raw JSON, never hits Granola)
+- `baez summarize-all --force` — Re-summarize everything (use after changing model)
+- `baez summarize-all --dry-run` — Preview what would be summarized
+- `baez set-api-key <key>` — Store Anthropic key in macOS keychain
+- `baez set-config --show` — Show summarization config
+- `baez set-config --model claude-sonnet-4-20250514` — Change model
+- `baez fix-dates` — Repair file mtimes from frontmatter `created` field
 
 ## System (Darwin/macOS)
 - `git`, `ls`, `cd`, `grep`, `find` — Standard Unix tools (macOS versions)
