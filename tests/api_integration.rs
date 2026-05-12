@@ -2,6 +2,7 @@
 // ABOUTME: Uses wiremock to verify HTTP request/response handling for documents, notes, and metadata
 
 use baez::api::ApiClient;
+use baez::Credentials;
 use wiremock::matchers::{body_partial_json, header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -31,7 +32,7 @@ async fn test_list_documents_success() {
 
     // Run blocking client in a blocking context
     let result = tokio::task::spawn_blocking(move || {
-        let client = ApiClient::new("test_token".into(), Some(uri))
+        let client = ApiClient::new(Credentials::Static("test_token".into()), Some(uri))
             .unwrap()
             .disable_throttle();
         client.list_documents()
@@ -58,7 +59,7 @@ async fn test_api_error_handling() {
 
     // Run blocking client in a blocking context
     let result = tokio::task::spawn_blocking(move || {
-        let client = ApiClient::new("bad_token".into(), Some(uri))
+        let client = ApiClient::new(Credentials::Static("bad_token".into()), Some(uri))
             .unwrap()
             .disable_throttle();
         client.list_documents()
@@ -110,7 +111,7 @@ async fn test_get_metadata_with_raw_preserves_unknown_fields() {
     let uri = mock_server.uri();
 
     let result = tokio::task::spawn_blocking(move || {
-        let client = ApiClient::new("test_token".into(), Some(uri))
+        let client = ApiClient::new(Credentials::Static("test_token".into()), Some(uri))
             .unwrap()
             .disable_throttle();
         client.get_metadata_with_raw("doc123")
@@ -157,7 +158,7 @@ async fn test_get_transcript_with_raw() {
     let uri = mock_server.uri();
 
     let result = tokio::task::spawn_blocking(move || {
-        let client = ApiClient::new("test_token".into(), Some(uri))
+        let client = ApiClient::new(Credentials::Static("test_token".into()), Some(uri))
             .unwrap()
             .disable_throttle();
         client.get_transcript_with_raw("doc123")
@@ -238,7 +239,7 @@ async fn test_list_documents_with_notes_returns_notes_and_lvp() {
     let uri = mock_server.uri();
 
     let result = tokio::task::spawn_blocking(move || {
-        let client = ApiClient::new("test_token".into(), Some(uri))
+        let client = ApiClient::new(Credentials::Static("test_token".into()), Some(uri))
             .unwrap()
             .disable_throttle();
         client.list_documents_with_notes()
@@ -312,7 +313,7 @@ async fn test_list_documents_with_notes_sends_correct_body() {
     let uri = mock_server.uri();
 
     let result = tokio::task::spawn_blocking(move || {
-        let client = ApiClient::new("test_token".into(), Some(uri))
+        let client = ApiClient::new(Credentials::Static("test_token".into()), Some(uri))
             .unwrap()
             .disable_throttle();
         client.list_documents_with_notes()

@@ -4,7 +4,7 @@
 
 use baez::{
     api::ApiClient,
-    auth::resolve_token,
+    auth::resolve_credentials,
     cli::Cli,
     storage::Paths,
     sync::{fix_dates, sync_all},
@@ -304,8 +304,8 @@ fn find_transcript_by_id(paths: &Paths, doc_id: &str) -> baez::Result<std::path:
 
 /// Creates an API client with auth and throttle configuration from CLI flags.
 fn create_client(cli: &Cli) -> Result<ApiClient> {
-    let token = resolve_token(cli.token.clone(), cli.verbose)?;
-    let mut client = ApiClient::new(token, Some(cli.api_base.clone()))?;
+    let credentials = resolve_credentials(cli.token.clone(), cli.verbose)?;
+    let mut client = ApiClient::new(credentials, Some(cli.api_base.clone()))?;
 
     if cli.no_throttle {
         client = client.disable_throttle();

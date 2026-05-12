@@ -2,6 +2,7 @@
 //!
 //! Handles throttling, auth headers, retries, and fail-fast errors.
 
+use crate::auth::Credentials;
 use crate::{DocumentMetadata, DocumentSummary, Error, PublicNote, RawTranscript, Result};
 use rand::Rng;
 use reqwest::blocking::Client;
@@ -37,24 +38,25 @@ fn truncate_str(s: &str, max_chars: usize) -> String {
     format!("{}...", &s[..boundary])
 }
 
-/// Blocking HTTP client for the Granola API with throttling and retry support.
+/// Blocking HTTP client for the Granola API with throttling, retry, and
+/// transparent token refresh on 401.
 pub struct ApiClient {
     client: Client,
     base_url: String,
-    token: String,
+    credentials: Credentials,
     throttle_min: u64,
     throttle_max: u64,
 }
 
 impl ApiClient {
     /// Create a new client. Uses `https://api.granola.ai` when `base_url` is `None`.
-    pub fn new(token: String, base_url: Option<String>) -> Result<Self> {
+    pub fn new(credentials: Credentials, base_url: Option<String>) -> Result<Self> {
         let client = Client::builder().timeout(Duration::from_secs(30)).build()?;
 
         Ok(ApiClient {
             client,
             base_url: base_url.unwrap_or_else(|| "https://api.granola.ai".into()),
-            token,
+            credentials,
             throttle_min: 100,
             throttle_max: 300,
         })
@@ -89,11 +91,26 @@ impl ApiClient {
         self.post_with_raw(endpoint, body).map(|r| r.parsed)
     }
 
-    /// Like post(), but also returns the raw response body text
+    /// Like post(), but also returns the raw response body text. On 401 with a
+    /// refreshable credential, attempts one refresh + retry.
     fn post_with_raw<T: serde::de::DeserializeOwned>(
         &self,
         endpoint: &str,
         body: serde_json::Value,
+    ) -> Result<ApiResponse<T>> {
+        let result = self.post_with_raw_once(endpoint, &body);
+        if matches!(&result, Err(Error::Api { status: 401, .. }))
+            && self.credentials.refresh_with_cas()?
+        {
+            return self.post_with_raw_once(endpoint, &body);
+        }
+        result
+    }
+
+    fn post_with_raw_once<T: serde::de::DeserializeOwned>(
+        &self,
+        endpoint: &str,
+        body: &serde_json::Value,
     ) -> Result<ApiResponse<T>> {
         let url = format!("{}{}", self.base_url, endpoint);
 
@@ -104,12 +121,15 @@ impl ApiClient {
                 let response = self
                     .client
                     .post(&url)
-                    .header("Authorization", format!("Bearer {}", self.token))
+                    .header(
+                        "Authorization",
+                        format!("Bearer {}", self.credentials.access_token()),
+                    )
                     .header("Accept", "*/*")
                     .header("Content-Type", "application/json")
                     .header("User-Agent", "Granola/5.354.0")
                     .header("X-Client-Version", "5.354.0")
-                    .json(&body)
+                    .json(body)
                     .send()?;
 
                 self.throttle();
@@ -186,8 +206,19 @@ impl ApiClient {
         )
     }
 
-    /// Internal helper for GET requests (the public API uses GET, not POST)
+    /// Internal helper for GET requests (the public API uses GET, not POST). On
+    /// 401 with a refreshable credential, attempts one refresh + retry.
     fn get<T: serde::de::DeserializeOwned>(&self, url: &str) -> Result<T> {
+        let result = self.get_once(url);
+        if matches!(&result, Err(Error::Api { status: 401, .. }))
+            && self.credentials.refresh_with_cas()?
+        {
+            return self.get_once(url);
+        }
+        result
+    }
+
+    fn get_once<T: serde::de::DeserializeOwned>(&self, url: &str) -> Result<T> {
         let raw = crate::util::retry_with_backoff(
             MAX_RETRIES,
             INITIAL_RETRY_DELAY,
@@ -195,7 +226,10 @@ impl ApiClient {
                 let response = self
                     .client
                     .get(url)
-                    .header("Authorization", format!("Bearer {}", self.token))
+                    .header(
+                        "Authorization",
+                        format!("Bearer {}", self.credentials.access_token()),
+                    )
                     .header("Accept", "application/json")
                     .header("User-Agent", "baez/1.0 (Rust)")
                     .send()?;
@@ -335,22 +369,27 @@ mod tests {
         assert!(!result.is_empty());
     }
 
+    fn static_creds(token: &str) -> Credentials {
+        Credentials::Static(token.to_string())
+    }
+
     #[test]
     fn test_api_client_new() {
-        let client = ApiClient::new("test_token".into(), None).unwrap();
+        let client = ApiClient::new(static_creds("test_token"), None).unwrap();
         assert_eq!(client.base_url, "https://api.granola.ai");
-        assert_eq!(client.token, "test_token");
+        assert_eq!(client.credentials.access_token(), "test_token");
     }
 
     #[test]
     fn test_api_client_custom_base() {
-        let client = ApiClient::new("token".into(), Some("https://custom.api".into())).unwrap();
+        let client =
+            ApiClient::new(static_creds("token"), Some("https://custom.api".into())).unwrap();
         assert_eq!(client.base_url, "https://custom.api");
     }
 
     #[test]
     fn test_api_client_throttle_config() {
-        let client = ApiClient::new("token".into(), None)
+        let client = ApiClient::new(static_creds("token"), None)
             .unwrap()
             .with_throttle(50, 150);
         assert_eq!(client.throttle_min, 50);
@@ -359,7 +398,7 @@ mod tests {
 
     #[test]
     fn test_api_client_disable_throttle() {
-        let client = ApiClient::new("token".into(), None)
+        let client = ApiClient::new(static_creds("token"), None)
             .unwrap()
             .disable_throttle();
         assert_eq!(client.throttle_min, 0);
@@ -368,29 +407,19 @@ mod tests {
 
     #[test]
     fn test_get_public_note_uses_public_api_base_url() {
-        // Verify the public note method constructs the correct URL
-        // by checking it does NOT use the configurable base_url.
-        // We can't test actual HTTP here, but we verify the client
-        // can be constructed and the method exists with the right signature.
-        let client = ApiClient::new("token".into(), Some("https://custom.api".into()))
+        let client = ApiClient::new(static_creds("token"), Some("https://custom.api".into()))
             .unwrap()
             .disable_throttle();
-        // The method should exist and accept a note_id string
-        // It will fail at the network level, not at construction
         let result = client.get_public_note("nonexistent-note-id");
-        // Should fail with a network/connection error, not a compile error
         assert!(result.is_err());
     }
 
     #[test]
     fn test_list_documents_with_notes_method_exists() {
-        // Verify the method exists and has the right return type signature.
-        // It will fail at the network level, not at construction.
-        let client = ApiClient::new("token".into(), None)
+        let client = ApiClient::new(static_creds("token"), None)
             .unwrap()
             .disable_throttle();
         let result = client.list_documents_with_notes();
-        // Should fail with a network/connection error, not a compile error
         assert!(result.is_err());
     }
 }
