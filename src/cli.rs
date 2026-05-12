@@ -13,12 +13,16 @@ pub struct Cli {
     #[command(subcommand)]
     pub command: Option<Commands>,
 
-    /// Granola token (overrides BAEZ_GRANOLA_TOKEN env var, config file, and session)
+    /// Granola public API key (overrides BAEZ_GRANOLA_API_KEY env var, config file, and keychain)
     #[arg(long, global = true)]
-    pub token: Option<String>,
+    pub api_key: Option<String>,
 
     /// API base URL
-    #[arg(long, global = true, default_value = "https://api.granola.ai")]
+    #[arg(
+        long,
+        global = true,
+        default_value = "https://public-api.granola.ai/v1"
+    )]
     pub api_base: String,
 
     /// Path to Obsidian vault root (overrides BAEZ_VAULT env var and config file)
@@ -83,6 +87,12 @@ pub enum Commands {
 
     /// Fix file modification dates to match meeting creation dates
     FixDates,
+
+    /// Store the Granola public API key in the macOS keychain
+    SetGranolaApiKey {
+        /// Granola public API key (generate one in Granola Desktop → Settings → Connectors → API keys)
+        api_key: String,
+    },
 
     /// Store Anthropic API key in system keychain (macOS only)
     #[cfg(feature = "summaries")]

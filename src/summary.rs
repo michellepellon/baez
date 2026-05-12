@@ -2,8 +2,7 @@
 //!
 //! Chunks long transcripts and generates structured meeting summaries.
 
-use crate::model::{DocumentMetadata, RawTranscript};
-use crate::util::normalize_timestamp;
+use crate::model::Note;
 use crate::{Error, Result};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
@@ -217,42 +216,60 @@ pub fn parse_summary_output(raw: &str) -> (String, Option<ExtractedEntities>) {
     }
 }
 
-/// Format a raw transcript into plain text suitable for LLM input.
+/// Format a `Note` (metadata + transcript) into plain text suitable for LLM input.
 /// Includes a metadata header (title, date, duration, participants) followed by
 /// `Speaker (HH:MM:SS): text` lines.
-pub fn format_transcript_for_llm(raw: &RawTranscript, meta: &DocumentMetadata) -> String {
+pub fn format_transcript_for_llm(note: &Note) -> String {
     let mut out = String::new();
 
     // Metadata header
-    if let Some(ref title) = meta.title {
+    if let Some(ref title) = note.title {
         out.push_str(&format!("Title: {}\n", title));
     }
     out.push_str(&format!(
         "Date: {}\n",
-        meta.created_at.format("%Y-%m-%d %H:%M UTC")
+        note.created_at.format("%Y-%m-%d %H:%M UTC")
     ));
-    if let Some(secs) = meta.duration_seconds {
+    if let Some(secs) = note.duration_seconds() {
         let mins = secs / 60;
         out.push_str(&format!("Duration: {} minutes\n", mins));
     }
-    if !meta.participants.is_empty() {
-        out.push_str(&format!("Participants: {}\n", meta.participants.join(", ")));
+    let participants = note.attendee_names();
+    if !participants.is_empty() {
+        out.push_str(&format!("Participants: {}\n", participants.join(", ")));
     }
     out.push_str("\n---\n\n");
 
     // Transcript entries
-    for entry in &raw.entries {
-        let speaker = entry.speaker.as_deref().unwrap_or("Speaker");
-        let timestamp = entry
-            .start
-            .as_deref()
-            .and_then(normalize_timestamp)
-            .map(|ts| format!(" ({})", ts))
-            .unwrap_or_default();
-        out.push_str(&format!("{}{}: {}\n", speaker, timestamp, entry.text));
+    if let Some(ref entries) = note.transcript {
+        for entry in entries {
+            let speaker = entry
+                .speaker
+                .as_ref()
+                .and_then(|s| s.diarization_label.clone())
+                .unwrap_or_else(|| "Speaker".to_string());
+            let timestamp = entry
+                .start_time
+                .map(|t| format_offset(t, note.created_at))
+                .map(|ts| format!(" ({})", ts))
+                .unwrap_or_default();
+            out.push_str(&format!("{}{}: {}\n", speaker, timestamp, entry.text));
+        }
     }
 
     out
+}
+
+/// Format a timestamp as `HH:MM:SS` offset from the meeting's start.
+fn format_offset(
+    timestamp: chrono::DateTime<chrono::Utc>,
+    meeting_start: chrono::DateTime<chrono::Utc>,
+) -> String {
+    let offset_secs = (timestamp - meeting_start).num_seconds().max(0);
+    let h = offset_secs / 3600;
+    let m = (offset_secs % 3600) / 60;
+    let s = offset_secs % 60;
+    format!("{:02}:{:02}:{:02}", h, m, s)
 }
 
 /// Build a reusable HTTP client for Claude API calls.
@@ -629,7 +646,7 @@ fn scan_entity_dir(dir: &std::path::Path) -> Option<Vec<String>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{DocumentMetadata, RawTranscript, TranscriptEntry};
+    use crate::model::{CalendarEvent, Speaker, TranscriptEntry, User};
 
     #[test]
     fn test_chunk_transcript_short() {
@@ -670,79 +687,83 @@ mod tests {
 
     #[test]
     fn test_format_transcript_for_llm() {
-        let raw = RawTranscript {
-            entries: vec![
-                TranscriptEntry {
-                    document_id: Some("doc123".into()),
-                    speaker: Some("Alice".into()),
-                    start: Some("2025-10-01T21:35:12.500Z".into()),
-                    end: None,
-                    text: "Hello everyone".into(),
-                    source: None,
-                    id: None,
-                    is_final: None,
+        let note = Note {
+            id: "doc123".into(),
+            title: Some("Test Meeting".into()),
+            owner: None,
+            created_at: "2025-10-28T21:35:00Z".parse().unwrap(),
+            updated_at: None,
+            web_url: None,
+            calendar_event: Some(CalendarEvent {
+                start: Some("2025-10-28T21:35:00Z".parse().unwrap()),
+                end: Some("2025-10-28T22:35:00Z".parse().unwrap()),
+            }),
+            attendees: vec![
+                User {
+                    name: Some("Alice".into()),
+                    email: None,
                 },
-                TranscriptEntry {
-                    document_id: Some("doc123".into()),
-                    speaker: Some("Bob".into()),
-                    start: Some("2025-10-01T21:35:20.000Z".into()),
-                    end: None,
-                    text: "Hi there".into(),
-                    source: None,
-                    id: None,
-                    is_final: None,
+                User {
+                    name: Some("Bob".into()),
+                    email: None,
                 },
             ],
+            folder_membership: vec![],
+            summary_text: None,
+            summary_markdown: None,
+            transcript: Some(vec![
+                TranscriptEntry {
+                    speaker: Some(Speaker {
+                        source: Some("microphone".into()),
+                        diarization_label: Some("Alice".into()),
+                    }),
+                    text: "Hello everyone".into(),
+                    start_time: Some("2025-10-28T21:35:12Z".parse().unwrap()),
+                    end_time: None,
+                },
+                TranscriptEntry {
+                    speaker: Some(Speaker {
+                        source: Some("microphone".into()),
+                        diarization_label: Some("Bob".into()),
+                    }),
+                    text: "Hi there".into(),
+                    start_time: Some("2025-10-28T21:35:20Z".parse().unwrap()),
+                    end_time: None,
+                },
+            ]),
         };
 
-        let meta = DocumentMetadata {
-            id: Some("doc123".into()),
-            title: Some("Test Meeting".into()),
-            created_at: "2025-10-28T15:04:05Z".parse().unwrap(),
-            updated_at: None,
-            participants: vec!["Alice".into(), "Bob".into()],
-            duration_seconds: Some(3600),
-            labels: vec![],
-            creator: None,
-            attendees: None,
-        };
-
-        let output = format_transcript_for_llm(&raw, &meta);
+        let output = format_transcript_for_llm(&note);
         assert!(output.contains("Title: Test Meeting"));
         assert!(output.contains("Duration: 60 minutes"));
         assert!(output.contains("Participants: Alice, Bob"));
-        assert!(output.contains("Alice (21:35:12): Hello everyone"));
-        assert!(output.contains("Bob (21:35:20): Hi there"));
+        assert!(output.contains("Alice (00:00:12): Hello everyone"));
+        assert!(output.contains("Bob (00:00:20): Hi there"));
     }
 
     #[test]
     fn test_format_transcript_for_llm_minimal() {
-        let raw = RawTranscript {
-            entries: vec![TranscriptEntry {
-                document_id: None,
-                speaker: None,
-                start: None,
-                end: None,
-                text: "Just text".into(),
-                source: None,
-                id: None,
-                is_final: None,
-            }],
-        };
-
-        let meta = DocumentMetadata {
-            id: None,
+        let note = Note {
+            id: "doc123".into(),
             title: None,
+            owner: None,
             created_at: "2025-10-28T15:04:05Z".parse().unwrap(),
             updated_at: None,
-            participants: vec![],
-            duration_seconds: None,
-            labels: vec![],
-            creator: None,
-            attendees: None,
+            web_url: None,
+            calendar_event: None,
+            attendees: vec![],
+            folder_membership: vec![],
+            summary_text: None,
+            summary_markdown: None,
+            transcript: Some(vec![TranscriptEntry {
+                speaker: None,
+                text: "Just text".into(),
+                start_time: None,
+                end_time: None,
+            }]),
         };
 
-        let output = format_transcript_for_llm(&raw, &meta);
+        let output = format_transcript_for_llm(&note);
         assert!(output.contains("Speaker: Just text"));
         assert!(!output.contains("Title:"));
         assert!(!output.contains("Duration:"));

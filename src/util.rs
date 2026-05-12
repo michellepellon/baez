@@ -2,7 +2,6 @@
 //!
 //! Provides consistent filename generation, time formatting, and retry logic.
 
-use crate::model::TimestampValue;
 use chrono::{DateTime, Utc};
 use std::thread;
 use std::time::Duration;
@@ -36,9 +35,8 @@ pub fn doc_slug(title: Option<&str>, doc_id: &str) -> String {
 
 /// Count the total number of words across all transcript entries.
 /// Used for triage: transcripts with < 20 words are classified as stubs.
-pub fn count_transcript_words(transcript: &crate::model::RawTranscript) -> usize {
-    transcript
-        .entries
+pub fn count_transcript_words(entries: &[crate::model::TranscriptEntry]) -> usize {
+    entries
         .iter()
         .map(|e| e.text.split_whitespace().count())
         .sum()
@@ -80,20 +78,6 @@ pub fn normalize_timestamp(ts: &str) -> Option<String> {
         Some(ts.to_string())
     } else {
         None
-    }
-}
-
-/// Normalize a [`TimestampValue`] (seconds or string) to `HH:MM:SS` format.
-pub fn normalize_timestamp_legacy(ts: &TimestampValue) -> Option<String> {
-    match ts {
-        TimestampValue::Seconds(secs) => {
-            let total_secs = *secs as u64;
-            let hours = total_secs / 3600;
-            let minutes = (total_secs % 3600) / 60;
-            let seconds = total_secs % 60;
-            Some(format!("{:02}:{:02}:{:02}", hours, minutes, seconds))
-        }
-        TimestampValue::String(s) => normalize_timestamp(s),
     }
 }
 
@@ -204,7 +188,6 @@ mod retry_tests {
 #[cfg(test)]
 mod timestamp_tests {
     use super::*;
-    use crate::model::TimestampValue;
 
     #[test]
     fn test_normalize_timestamp_iso8601() {
@@ -223,18 +206,6 @@ mod timestamp_tests {
         assert_eq!(normalize_timestamp("00:12:34.567"), Some("00:12:34".into()));
         assert_eq!(normalize_timestamp("00:05:10"), Some("00:05:10".into()));
     }
-
-    #[test]
-    fn test_normalize_timestamp_legacy_seconds() {
-        let ts = TimestampValue::Seconds(3665.5);
-        assert_eq!(normalize_timestamp_legacy(&ts), Some("01:01:05".into()));
-    }
-
-    #[test]
-    fn test_normalize_timestamp_legacy_string() {
-        let ts = TimestampValue::String("00:12:34.567".into());
-        assert_eq!(normalize_timestamp_legacy(&ts), Some("00:12:34".into()));
-    }
 }
 
 /// Compute Levenshtein edit distance between two strings.
@@ -245,33 +216,27 @@ pub fn levenshtein_distance(a: &str, b: &str) -> usize {
 #[cfg(test)]
 mod triage_tests {
     use super::*;
-    use crate::model::{RawTranscript, TranscriptEntry};
+    use crate::model::TranscriptEntry;
 
     fn make_entry(text: &str) -> TranscriptEntry {
         TranscriptEntry {
-            document_id: None,
             speaker: None,
-            start: None,
-            end: None,
             text: text.into(),
-            source: None,
-            id: None,
-            is_final: None,
+            start_time: None,
+            end_time: None,
         }
     }
 
     #[test]
     fn test_empty_transcript() {
-        let t = RawTranscript { entries: vec![] };
-        assert_eq!(count_transcript_words(&t), 0);
+        let entries: Vec<TranscriptEntry> = vec![];
+        assert_eq!(count_transcript_words(&entries), 0);
     }
 
     #[test]
     fn test_stub_transcript() {
-        let t = RawTranscript {
-            entries: vec![make_entry("hello world")],
-        };
-        assert_eq!(count_transcript_words(&t), 2);
+        let entries = vec![make_entry("hello world")];
+        assert_eq!(count_transcript_words(&entries), 2);
     }
 
     #[test]
@@ -280,26 +245,20 @@ mod triage_tests {
             .map(|i| format!("word{}", i))
             .collect::<Vec<_>>()
             .join(" ");
-        let t = RawTranscript {
-            entries: vec![make_entry(&words)],
-        };
-        assert_eq!(count_transcript_words(&t), 25);
+        let entries = vec![make_entry(&words)];
+        assert_eq!(count_transcript_words(&entries), 25);
     }
 
     #[test]
     fn test_whitespace_only_entries() {
-        let t = RawTranscript {
-            entries: vec![make_entry("   "), make_entry(""), make_entry("\n\t")],
-        };
-        assert_eq!(count_transcript_words(&t), 0);
+        let entries = vec![make_entry("   "), make_entry(""), make_entry("\n\t")];
+        assert_eq!(count_transcript_words(&entries), 0);
     }
 
     #[test]
     fn test_multiple_entries_summed() {
-        let t = RawTranscript {
-            entries: vec![make_entry("one two three"), make_entry("four five")],
-        };
-        assert_eq!(count_transcript_words(&t), 5);
+        let entries = vec![make_entry("one two three"), make_entry("four five")];
+        assert_eq!(count_transcript_words(&entries), 5);
     }
 }
 
