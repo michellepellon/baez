@@ -106,7 +106,9 @@ impl Default for SummaryConfig {
     fn default() -> Self {
         Self {
             model: "claude-opus-4-6".to_string(),
-            max_input_chars: 600_000, // ~150K tokens
+            // ~100K tokens — leaves headroom under the 200K-token context window
+            // for the system prompt and existing-entities preamble.
+            max_input_chars: 400_000,
             max_tokens: 8192,
             custom_prompt: None,
             temperature: None,
@@ -275,7 +277,7 @@ fn format_offset(
 /// Build a reusable HTTP client for Claude API calls.
 pub fn build_claude_client() -> Result<reqwest::blocking::Client> {
     reqwest::blocking::Client::builder()
-        .timeout(std::time::Duration::from_secs(120))
+        .timeout(std::time::Duration::from_secs(300))
         .build()
         .map_err(|e| Error::Summarization(format!("Failed to build HTTP client: {}", e)))
 }
@@ -363,11 +365,19 @@ fn call_claude_api(
                 .header("content-type", "application/json")
                 .json(&body)
                 .send()
-                .map_err(|e| Error::Summarization(format!("Claude API request failed: {}", e)))?;
+                .map_err(|e| {
+                    Error::Summarization(format!(
+                        "Claude API request failed: {}",
+                        crate::util::format_reqwest_error(&e)
+                    ))
+                })?;
 
             let status = response.status();
             let text = response.text().map_err(|e| {
-                Error::Summarization(format!("Failed to read Claude API response: {}", e))
+                Error::Summarization(format!(
+                    "Failed to read Claude API response: {}",
+                    crate::util::format_reqwest_error(&e)
+                ))
             })?;
 
             if !status.is_success() {
@@ -679,7 +689,7 @@ mod tests {
     fn test_summary_config_defaults() {
         let config = SummaryConfig::default();
         assert_eq!(config.model, "claude-opus-4-6");
-        assert_eq!(config.max_input_chars, 600_000);
+        assert_eq!(config.max_input_chars, 400_000);
         assert_eq!(config.max_tokens, 8192);
         assert!(config.custom_prompt.is_none());
         assert!(config.temperature.is_none());

@@ -3,8 +3,41 @@
 //! Provides consistent filename generation, time formatting, and retry logic.
 
 use chrono::{DateTime, Utc};
+use std::error::Error as _;
 use std::thread;
 use std::time::Duration;
+
+/// Format a `reqwest::Error` with its full source chain and a category tag.
+///
+/// reqwest's `Display` only renders the top-level message (e.g. "error sending
+/// request for url (...)") and hides the underlying cause. This walks
+/// `source()` to expose the real failure (timeout, connection reset, body
+/// error) and prefixes a category derived from reqwest's classifier methods.
+pub fn format_reqwest_error(err: &reqwest::Error) -> String {
+    let category = if err.is_timeout() {
+        "timeout"
+    } else if err.is_connect() {
+        "connect"
+    } else if err.is_body() {
+        "body"
+    } else if err.is_decode() {
+        "decode"
+    } else if err.is_request() {
+        "request"
+    } else if err.is_status() {
+        "status"
+    } else {
+        "transport"
+    };
+
+    let mut msg = format!("[{}] {}", category, err);
+    let mut source: Option<&dyn std::error::Error> = err.source();
+    while let Some(cause) = source {
+        msg.push_str(&format!(": {}", cause));
+        source = cause.source();
+    }
+    msg
+}
 
 /// Convert text to a URL-safe slug for filenames. Returns `"untitled"` for empty input.
 pub fn slugify(text: &str) -> String {
