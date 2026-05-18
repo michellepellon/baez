@@ -109,7 +109,10 @@ impl Default for SummaryConfig {
             // ~100K tokens — leaves headroom under the 200K-token context window
             // for the system prompt and existing-entities preamble.
             max_input_chars: 400_000,
-            max_tokens: 8192,
+            // Claude Opus 4.6's synchronous output cap. max_tokens is a ceiling,
+            // not a target — billing is per token actually generated — so default
+            // to the max to avoid truncating long summaries with entity blocks.
+            max_tokens: 128_000,
             custom_prompt: None,
             temperature: None,
         }
@@ -202,12 +205,25 @@ pub fn parse_summary_output(raw: &str) -> (String, Option<ExtractedEntities>) {
     let markdown = raw[..marker_start].trim_end().to_string();
 
     let json_start = marker_start + ENTITY_MARKER_START.len();
-    let Some(marker_end) = raw[json_start..].find(ENTITY_MARKER_END) else {
-        eprintln!("Warning: Found baez-entities marker but no closing -->");
-        return (raw.to_string(), None);
+    let json_str = match raw[json_start..].find(ENTITY_MARKER_END) {
+        Some(marker_end) => raw[json_start..json_start + marker_end].trim(),
+        None => {
+            // Closing `-->` is missing. Usually the response was truncated by
+            // `max_tokens`; occasionally the model just forgot the comment close.
+            // Try the remainder anyway — if the JSON object completed, we recover.
+            let candidate = raw[json_start..].trim();
+            match serde_json::from_str::<ExtractedEntities>(candidate) {
+                Ok(entities) => return (markdown, Some(entities)),
+                Err(_) => {
+                    eprintln!(
+                        "Warning: baez-entities block was not closed and remainder \
+                         is not valid JSON — response likely truncated by max_tokens"
+                    );
+                    return (raw.to_string(), None);
+                }
+            }
+        }
     };
-
-    let json_str = raw[json_start..json_start + marker_end].trim();
 
     match serde_json::from_str::<ExtractedEntities>(json_str) {
         Ok(entities) => (markdown, Some(entities)),
@@ -407,6 +423,14 @@ fn call_claude_api(
 
     let response_json: serde_json::Value = serde_json::from_str(&response_text)
         .map_err(|e| Error::Summarization(format!("Failed to parse Claude API response: {}", e)))?;
+
+    if response_json["stop_reason"].as_str() == Some("max_tokens") {
+        eprintln!(
+            "Warning: Claude response truncated at max_tokens={}. Raise `max_tokens` \
+             in the summary config to avoid losing entity extraction.",
+            config.max_tokens
+        );
+    }
 
     // Extract text from content array
     response_json["content"]
@@ -690,7 +714,7 @@ mod tests {
         let config = SummaryConfig::default();
         assert_eq!(config.model, "claude-opus-4-6");
         assert_eq!(config.max_input_chars, 400_000);
-        assert_eq!(config.max_tokens, 8192);
+        assert_eq!(config.max_tokens, 128_000);
         assert!(config.custom_prompt.is_none());
         assert!(config.temperature.is_none());
     }
@@ -879,6 +903,27 @@ mod parse_tests {
         let input = "## Summary\n\n<!-- baez-entities\n{invalid json\n-->";
         let (markdown, entities) = parse_summary_output(input);
         assert!(markdown.contains("## Summary"));
+        assert!(entities.is_none());
+    }
+
+    #[test]
+    fn test_parse_recovers_when_closing_marker_missing_but_json_complete() {
+        // Model emitted valid JSON but forgot the closing `-->`. We should
+        // still recover the entities rather than dropping them.
+        let input = "## Summary\n- Point\n\n<!-- baez-entities\n{\"people\": [{\"name\": \"Bob\", \"context\": \"PM\"}], \"concepts\": [], \"projects\": []}";
+        let (markdown, entities) = parse_summary_output(input);
+        assert!(markdown.contains("## Summary"));
+        let entities = entities.expect("should recover entities from unclosed block");
+        assert_eq!(entities.people.len(), 1);
+        assert_eq!(entities.people[0].name, "Bob");
+    }
+
+    #[test]
+    fn test_parse_truncated_json_returns_none() {
+        // Response was cut off mid-JSON — no recovery possible, must warn.
+        let input = "## Summary\n\n<!-- baez-entities\n{\"people\": [{\"name\": \"Bob\"";
+        let (markdown, entities) = parse_summary_output(input);
+        assert_eq!(markdown, input);
         assert!(entities.is_none());
     }
 
